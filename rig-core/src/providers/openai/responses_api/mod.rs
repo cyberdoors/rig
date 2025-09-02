@@ -9,7 +9,7 @@
 //! ```
 use super::{Client, responses_api::streaming::StreamingCompletionResponse};
 use super::{ImageUrl, InputAudio, SystemContent};
-use crate::completion::CompletionError;
+use crate::completion::{CompletionError, CompletionModelDyn};
 use crate::json_utils;
 use crate::message::{AudioMediaType, Document, MessageError, Text};
 use crate::one_or_many::string_or_one_or_many;
@@ -18,9 +18,12 @@ use crate::{OneOrMany, completion, message};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::agent::AgentBuilder;
+use crate::client::completion::CompletionModelHandle;
 use std::convert::Infallible;
 use std::ops::Add;
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub mod streaming;
 
@@ -617,6 +620,18 @@ impl ResponsesCompletionModel {
     /// Use the Completions API instead of Responses.
     pub fn completions_api(self) -> crate::providers::openai::completion::CompletionModel {
         crate::providers::openai::completion::CompletionModel::new(self.client, &self.model)
+    }
+
+    /// Create an AgentBuilder using the Completions API via a CompletionModelDyn handle.
+    pub fn into_dyn_agent_builder(
+        self,
+    ) -> AgentBuilder<CompletionModelHandle<'static>> {
+        let model =
+            crate::providers::openai::completion::CompletionModel::new(self.client, &self.model);
+        let handle = CompletionModelHandle {
+            inner: Arc::new(model) as Arc<dyn CompletionModelDyn + 'static>,
+        };
+        AgentBuilder::new(handle)
     }
 
     /// Attempt to create a completion request from [`crate::completion::CompletionRequest`].

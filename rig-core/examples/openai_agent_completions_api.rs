@@ -19,6 +19,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let res = agent.prompt("Hello world!").await.unwrap();
 
     println!("GPT-4o: {res}");
+    
+    let agent2 = providers::openai::Client::from_env()
+        .completion_model("gpt-4o")
+        .into_dyn_agent_builder()
+        .preamble("You are a helpful assistant")
+        .build();
+
+    let res2 = agent2.prompt("Hello world!").await.unwrap();
+
+    println!("GPT-4o: {res2}");
 
     Ok(())
 }
