@@ -24,6 +24,7 @@ use std::convert::Infallible;
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
+use schemars::JsonSchema;
 
 pub mod streaming;
 
@@ -632,6 +633,18 @@ impl ResponsesCompletionModel {
             inner: Arc::new(model) as Arc<dyn CompletionModelDyn + 'static>,
         };
         AgentBuilder::new(handle)
+    }
+
+    /// Create an ExtractorBuilder using the Completions API.
+    pub fn completions_api_extractor<
+        T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+    >(
+        self,
+    ) -> crate::extractor::ExtractorBuilder<crate::providers::openai::completion::CompletionModel, T>
+    {
+        let model =
+            crate::providers::openai::completion::CompletionModel::new(self.client, &self.model);
+        crate::extractor::ExtractorBuilder::new(model)
     }
 
     /// Attempt to create a completion request from [`crate::completion::CompletionRequest`].
