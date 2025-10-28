@@ -39,11 +39,12 @@
 //! let extractor = client.extractor::<serde_json::Value>("llama3.2");
 //! ```
 use crate::client::{
-    ClientBuilderError, CompletionClient, EmbeddingsClient, ProviderClient, VerifyClient,
-    VerifyError,
+    CompletionClient, EmbeddingsClient, ProviderClient, VerifyClient, VerifyError,
 };
 use crate::completion::{GetTokenUsage, Usage};
+use crate::http_client::{self, HttpClientExt};
 use crate::json_utils::merge_inplace;
+use crate::message::DocumentSourceKind;
 use crate::streaming::RawStreamingChoice;
 use crate::{
     Embed, OneOrMany,
@@ -53,28 +54,43 @@ use crate::{
     message::{ImageDetail, Text},
     streaming,
 };
-use async_stream::stream;
+use async_stream::try_stream;
+use bytes::Bytes;
 use futures::StreamExt;
 use reqwest;
+// use reqwest_eventsource::{Event, RequestBuilderExt}; // (Not used currently as Ollama does not support SSE)
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{convert::TryFrom, str::FromStr};
-use url::Url;
+use tracing::info_span;
+use tracing_futures::Instrument;
 // ---------- Main Client ----------
 
 const OLLAMA_API_BASE_URL: &str = "http://localhost:11434";
 
-pub struct ClientBuilder<'a> {
+pub struct ClientBuilder<'a, T = reqwest::Client> {
     base_url: &'a str,
-    http_client: Option<reqwest::Client>,
+    http_client: T,
 }
 
-impl<'a> ClientBuilder<'a> {
+impl<'a, T> ClientBuilder<'a, T>
+where
+    T: Default,
+{
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             base_url: OLLAMA_API_BASE_URL,
-            http_client: None,
+            http_client: Default::default(),
+        }
+    }
+}
+
+impl<'a, T> ClientBuilder<'a, T> {
+    pub fn new_with_client(http_client: T) -> Self {
+        Self {
+            base_url: OLLAMA_API_BASE_URL,
+            http_client,
         }
     }
 
@@ -83,79 +99,69 @@ impl<'a> ClientBuilder<'a> {
         self
     }
 
-    pub fn custom_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
-        self
+    pub fn with_client<U>(self, http_client: U) -> ClientBuilder<'a, U> {
+        ClientBuilder {
+            base_url: self.base_url,
+            http_client,
+        }
     }
 
-    pub fn build(self) -> Result<Client, ClientBuilderError> {
-        let http_client = if let Some(http_client) = self.http_client {
-            http_client
-        } else {
-            reqwest::Client::builder().build()?
-        };
-
-        Ok(Client {
-            base_url: Url::parse(self.base_url)
-                .map_err(|_| ClientBuilderError::InvalidProperty("base_url"))?,
-            http_client,
-        })
+    pub fn build(self) -> Client<T> {
+        Client {
+            base_url: self.base_url.into(),
+            http_client: self.http_client,
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct Client {
-    base_url: Url,
-    http_client: reqwest::Client,
+pub struct Client<T = reqwest::Client> {
+    base_url: String,
+    http_client: T,
 }
 
-impl Default for Client {
+impl<T> Client<T> {
+    fn req(&self, method: http_client::Method, path: &str) -> http_client::Builder {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        http_client::Builder::new().method(method).uri(url)
+    }
+
+    pub(crate) fn post(&self, path: &str) -> http_client::Builder {
+        self.req(http_client::Method::POST, path)
+    }
+
+    pub(crate) fn get(&self, path: &str) -> http_client::Builder {
+        self.req(http_client::Method::GET, path)
+    }
+}
+
+impl Client<reqwest::Client> {
+    pub fn builder<'a>() -> ClientBuilder<'a, reqwest::Client> {
+        ClientBuilder::new()
+    }
+
+    pub fn new() -> Self {
+        Self::builder().build()
+    }
+
+    pub fn from_env() -> Self {
+        <Self as ProviderClient>::from_env()
+    }
+}
+
+impl Default for Client<reqwest::Client> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Client {
-    /// Create a new Ollama client builder.
-    ///
-    /// # Example
-    /// ```
-    /// use rig::providers::ollama::{ClientBuilder, self};
-    ///
-    /// // Initialize the Ollama client
-    /// let client = Client::builder()
-    ///    .build()
-    /// ```
-    pub fn builder() -> ClientBuilder<'static> {
-        ClientBuilder::new()
-    }
-
-    /// Create a new Ollama client. For more control, use the `builder` method.
-    ///
-    /// # Panics
-    /// - If the reqwest client cannot be built (if the TLS backend cannot be initialized).
-    pub fn new() -> Self {
-        Self::builder().build().expect("Ollama client should build")
-    }
-
-    pub(crate) fn post(&self, path: &str) -> Result<reqwest::RequestBuilder, url::ParseError> {
-        let url = self.base_url.join(path)?;
-        Ok(self.http_client.post(url))
-    }
-
-    pub(crate) fn get(&self, path: &str) -> Result<reqwest::RequestBuilder, url::ParseError> {
-        let url = self.base_url.join(path)?;
-        Ok(self.http_client.get(url))
-    }
-}
-
-impl ProviderClient for Client {
-    fn from_env() -> Self
-    where
-        Self: Sized,
-    {
+impl<T> ProviderClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    fn from_env() -> Self {
         let api_base = std::env::var("OLLAMA_API_BASE_URL").expect("OLLAMA_API_BASE_URL not set");
-        Self::builder().base_url(&api_base).build().unwrap()
+        ClientBuilder::new().base_url(&api_base).build()
     }
 
     fn from_val(input: crate::client::ProviderValue) -> Self {
@@ -163,43 +169,61 @@ impl ProviderClient for Client {
             panic!("Incorrect provider value type")
         };
 
-        Self::new()
+        ClientBuilder::new().build()
     }
 }
 
-impl CompletionClient for Client {
-    type CompletionModel = CompletionModel;
+impl<T> CompletionClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    type CompletionModel = CompletionModel<T>;
 
-    fn completion_model(&self, model: &str) -> CompletionModel {
+    fn completion_model(&self, model: &str) -> Self::CompletionModel {
         CompletionModel::new(self.clone(), model)
     }
 }
 
-impl EmbeddingsClient for Client {
-    type EmbeddingModel = EmbeddingModel;
-    fn embedding_model(&self, model: &str) -> EmbeddingModel {
+impl<T> EmbeddingsClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    type EmbeddingModel = EmbeddingModel<T>;
+    fn embedding_model(&self, model: &str) -> Self::EmbeddingModel {
         EmbeddingModel::new(self.clone(), model, 0)
     }
-    fn embedding_model_with_ndims(&self, model: &str, ndims: usize) -> EmbeddingModel {
+    fn embedding_model_with_ndims(&self, model: &str, ndims: usize) -> Self::EmbeddingModel {
         EmbeddingModel::new(self.clone(), model, ndims)
     }
-    fn embeddings<D: Embed>(&self, model: &str) -> EmbeddingsBuilder<EmbeddingModel, D> {
+    fn embeddings<D: Embed>(&self, model: &str) -> EmbeddingsBuilder<Self::EmbeddingModel, D> {
         EmbeddingsBuilder::new(self.embedding_model(model))
     }
 }
 
-impl VerifyClient for Client {
+impl<T> VerifyClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
     #[cfg_attr(feature = "worker", worker::send)]
     async fn verify(&self) -> Result<(), VerifyError> {
-        let response = self
+        let req = self
             .get("api/tags")
-            .expect("Failed to build request")
-            .send()
-            .await?;
+            .body(http_client::NoBody)
+            .map_err(http_client::Error::from)?;
+
+        let response = HttpClientExt::send(&self.http_client, req).await?;
+
         match response.status() {
             reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::UNAUTHORIZED => Err(VerifyError::InvalidAuthentication),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::BAD_GATEWAY => {
+                let text = http_client::text(response).await?;
+                Err(VerifyError::ProviderError(text))
+            }
             _ => {
-                response.error_for_status()?;
+                //response.error_for_status()?;
                 Ok(())
             }
         }
@@ -209,7 +233,7 @@ impl VerifyClient for Client {
 impl_conversion_traits!(
     AsTranscription,
     AsImageGeneration,
-    AsAudioGeneration for Client
+    AsAudioGeneration for Client<T>
 );
 
 // ---------- API Error and Response Structures ----------
@@ -261,14 +285,14 @@ impl From<ApiResponse<EmbeddingResponse>> for Result<EmbeddingResponse, Embeddin
 // ---------- Embedding Model ----------
 
 #[derive(Clone)]
-pub struct EmbeddingModel {
-    client: Client,
+pub struct EmbeddingModel<T> {
+    client: Client<T>,
     pub model: String,
     ndims: usize,
 }
 
-impl EmbeddingModel {
-    pub fn new(client: Client, model: &str, ndims: usize) -> Self {
+impl<T> EmbeddingModel<T> {
+    pub fn new(client: Client<T>, model: &str, ndims: usize) -> Self {
         Self {
             client,
             model: model.to_owned(),
@@ -277,7 +301,10 @@ impl EmbeddingModel {
     }
 }
 
-impl embeddings::EmbeddingModel for EmbeddingModel {
+impl<T> embeddings::EmbeddingModel for EmbeddingModel<T>
+where
+    T: HttpClientExt + Clone + 'static,
+{
     const MAX_DOCUMENTS: usize = 1024;
     fn ndims(&self) -> usize {
         self.ndims
@@ -288,36 +315,41 @@ impl embeddings::EmbeddingModel for EmbeddingModel {
         documents: impl IntoIterator<Item = String>,
     ) -> Result<Vec<embeddings::Embedding>, EmbeddingError> {
         let docs: Vec<String> = documents.into_iter().collect();
-        let payload = json!({
+
+        let body = serde_json::to_vec(&json!({
             "model": self.model,
-            "input": docs,
-        });
-        let response = self
+            "input": docs
+        }))?;
+
+        let req = self
             .client
-            .post("api/embed")?
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
-        if response.status().is_success() {
-            let api_resp: EmbeddingResponse = response
-                .json()
-                .await
-                .map_err(|e| EmbeddingError::ProviderError(e.to_string()))?;
-            if api_resp.embeddings.len() != docs.len() {
-                return Err(EmbeddingError::ResponseError(
-                    "Number of returned embeddings does not match input".into(),
-                ));
-            }
-            Ok(api_resp
-                .embeddings
-                .into_iter()
-                .zip(docs.into_iter())
-                .map(|(vec, document)| embeddings::Embedding { document, vec })
-                .collect())
-        } else {
-            Err(EmbeddingError::ProviderError(response.text().await?))
+            .post("api/embed")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| EmbeddingError::HttpError(e.into()))?;
+
+        let response = HttpClientExt::send(&self.client.http_client, req).await?;
+
+        if !response.status().is_success() {
+            let text = http_client::text(response).await?;
+            return Err(EmbeddingError::ProviderError(text));
         }
+
+        let bytes: Vec<u8> = response.into_body().await?;
+
+        let api_resp: EmbeddingResponse = serde_json::from_slice(&bytes)?;
+
+        if api_resp.embeddings.len() != docs.len() {
+            return Err(EmbeddingError::ResponseError(
+                "Number of returned embeddings does not match input".into(),
+            ));
+        }
+        Ok(api_resp
+            .embeddings
+            .into_iter()
+            .zip(docs.into_iter())
+            .map(|(vec, document)| embeddings::Embedding { document, vec })
+            .collect())
     }
 }
 
@@ -419,13 +451,13 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
 // ---------- Completion Model ----------
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    client: Client,
+pub struct CompletionModel<T> {
+    client: Client<T>,
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T> {
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_owned(),
@@ -436,6 +468,10 @@ impl CompletionModel {
         &self,
         completion_request: CompletionRequest,
     ) -> Result<Value, CompletionError> {
+        if completion_request.tool_choice.is_some() {
+            tracing::warn!("WARNING: `tool_choice` not supported for Ollama");
+        }
+
         // Build up the order of messages (context, chat_history)
         let mut partial_history = vec![];
         if let Some(docs) = completion_request.normalized_documents() {
@@ -459,8 +495,17 @@ impl CompletionModel {
                 .collect::<Vec<Message>>(),
         );
 
+        let mut request_payload = json!({
+            "model": self.model,
+            "messages": full_history,
+            "stream": false,
+        });
+
         // Convert internal prompt into a provider Message
-        let options = if let Some(extra) = completion_request.additional_params {
+        let options = if let Some(mut extra) = completion_request.additional_params {
+            if extra.get("think").is_some() {
+                request_payload["think"] = extra["think"].take();
+            }
             json_utils::merge(
                 json!({ "temperature": completion_request.temperature }),
                 extra,
@@ -469,12 +514,8 @@ impl CompletionModel {
             json!({ "temperature": completion_request.temperature })
         };
 
-        let mut request_payload = json!({
-            "model": self.model,
-            "messages": full_history,
-            "options": options,
-            "stream": false,
-        });
+        request_payload["options"] = options;
+
         if !completion_request.tools.is_empty() {
             request_payload["tools"] = json!(
                 completion_request
@@ -517,7 +558,10 @@ impl GetTokenUsage for StreamingCompletionResponse {
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
+{
     type Response = CompletionResponse;
     type StreamingResponse = StreamingCompletionResponse;
 
@@ -526,32 +570,73 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<Self::Response>, CompletionError> {
-        let request_payload = self.create_completion_request(completion_request)?;
+        let preamble = completion_request.preamble.clone();
+        let request = self.create_completion_request(completion_request)?;
 
-        let response = self
-            .client
-            .post("api/chat")?
-            .json(&request_payload)
-            .send()
-            .await
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
-        if response.status().is_success() {
-            let text = response
-                .text()
-                .await
-                .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
-            tracing::debug!(target: "rig", "Ollama chat response: {}", text);
-            let chat_resp: CompletionResponse = serde_json::from_str(&text)
-                .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
-            let conv: completion::CompletionResponse<CompletionResponse> = chat_resp.try_into()?;
-            Ok(conv)
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "ollama",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(&request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            let err_text = response
-                .text()
-                .await
-                .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
-            Err(CompletionError::ProviderError(err_text))
-        }
+            tracing::Span::current()
+        };
+
+        let body = serde_json::to_vec(&request)?;
+
+        let req = self
+            .client
+            .post("api/chat")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(http_client::Error::from)?;
+
+        let async_block = async move {
+            let response = self.client.http_client.send::<_, Bytes>(req).await?;
+            let status = response.status();
+            let response_body = response.into_body().into_future().await?.to_vec();
+
+            if !status.is_success() {
+                return Err(CompletionError::ProviderError(
+                    String::from_utf8_lossy(&response_body).to_string(),
+                ));
+            }
+
+            let response: CompletionResponse = serde_json::from_slice(&response_body)?;
+            let span = tracing::Span::current();
+            span.record("gen_ai.response.model_name", &response.model);
+            span.record(
+                "gen_ai.output.messages",
+                serde_json::to_string(&vec![&response.message]).unwrap(),
+            );
+            span.record(
+                "gen_ai.usage.input_tokens",
+                response.prompt_eval_count.unwrap_or_default(),
+            );
+            span.record(
+                "gen_ai.usage.output_tokens",
+                response.eval_count.unwrap_or_default(),
+            );
+
+            tracing::debug!(target: "rig", "Received response from Ollama: {}", serde_json::to_string_pretty(&response)?);
+
+            let response: completion::CompletionResponse<CompletionResponse> =
+                response.try_into()?;
+
+            Ok(response)
+        };
+
+        tracing::Instrument::instrument(async_block, span).await
     }
 
     #[cfg_attr(feature = "worker", worker::send)]
@@ -560,90 +645,124 @@ impl completion::CompletionModel for CompletionModel {
         request: CompletionRequest,
     ) -> Result<streaming::StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
     {
-        let mut request_payload = self.create_completion_request(request)?;
-        merge_inplace(&mut request_payload, json!({"stream": true}));
+        let preamble = request.preamble.clone();
+        let mut request = self.create_completion_request(request)?;
+        merge_inplace(&mut request, json!({"stream": true}));
 
-        let response = self
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat_streaming",
+                gen_ai.operation.name = "chat_streaming",
+                gen_ai.provider.name = "ollama",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = self.model,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(&request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
+        let body = serde_json::to_vec(&request)?;
+
+        let req = self
             .client
-            .post("api/chat")?
-            .json(&request_payload)
-            .send()
-            .await
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+            .post("api/chat")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(http_client::Error::from)?;
 
-        if !response.status().is_success() {
-            let err_text = response
-                .text()
-                .await
-                .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
-            return Err(CompletionError::ProviderError(err_text));
+        let response = self.client.http_client.send_streaming(req).await?;
+        let status = response.status();
+        let mut byte_stream = response.into_body();
+
+        if !status.is_success() {
+            return Err(CompletionError::ProviderError(format!(
+                "Got error status code trying to send a request to Ollama: {status}"
+            )));
         }
 
-        let stream = Box::pin(stream! {
-            let mut stream = response.bytes_stream();
-            while let Some(chunk_result) = stream.next().await {
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        yield Err(CompletionError::from(e));
-                        break;
-                    }
-                };
+        let stream = try_stream! {
+            let span = tracing::Span::current();
+            let mut tool_calls_final = Vec::new();
+            let mut text_response = String::new();
+            let mut thinking_response = String::new();
 
-                let text = match String::from_utf8(chunk.to_vec()) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        yield Err(CompletionError::ResponseError(e.to_string()));
-                        break;
-                    }
-                };
+            while let Some(chunk) = byte_stream.next().await {
+                let bytes = chunk.map_err(|e| http_client::Error::Instance(e.into()))?;
 
-
-                for line in text.lines() {
-                    let line = line.to_string();
-
-                    let Ok(response) = serde_json::from_str::<CompletionResponse>(&line) else {
+                for line in bytes.split(|&b| b == b'\n') {
+                    if line.is_empty() {
                         continue;
-                    };
-
-                    match response.message {
-                        Message::Assistant{ content, tool_calls, .. } => {
-                            if !content.is_empty() {
-                                yield Ok(RawStreamingChoice::Message(content))
-                            }
-
-                            for tool_call in tool_calls.iter() {
-                                let function = tool_call.function.clone();
-
-                                yield Ok(RawStreamingChoice::ToolCall {
-                                    id: "".to_string(),
-                                    name: function.name,
-                                    arguments: function.arguments,
-                                    call_id: None
-                                });
-                            }
-                        }
-                        _ => {
-                            continue;
-                        }
                     }
+
+                    tracing::debug!(target: "rig", "Received NDJSON line from Ollama: {}", String::from_utf8_lossy(line));
+
+                    let response: CompletionResponse = serde_json::from_slice(line)?;
 
                     if response.done {
-                        yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                            total_duration: response.total_duration,
-                            load_duration: response.load_duration,
-                            prompt_eval_count: response.prompt_eval_count,
-                            prompt_eval_duration: response.prompt_eval_duration,
-                            eval_count: response.eval_count,
-                            eval_duration: response.eval_duration,
-                            done_reason: response.done_reason,
-                        }));
+                        span.record("gen_ai.usage.input_tokens", response.prompt_eval_count);
+                        span.record("gen_ai.usage.output_tokens", response.eval_count);
+                        let message = Message::Assistant {
+                            content: text_response.clone(),
+                            thinking: if thinking_response.is_empty() { None } else { Some(thinking_response.clone()) },
+                            images: None,
+                            name: None,
+                            tool_calls: tool_calls_final.clone()
+                        };
+                        span.record("gen_ai.output.messages", serde_json::to_string(&vec![message]).unwrap());
+                        yield RawStreamingChoice::FinalResponse(
+                            StreamingCompletionResponse {
+                                total_duration: response.total_duration,
+                                load_duration: response.load_duration,
+                                prompt_eval_count: response.prompt_eval_count,
+                                prompt_eval_duration: response.prompt_eval_duration,
+                                eval_count: response.eval_count,
+                                eval_duration: response.eval_duration,
+                                done_reason: response.done_reason,
+                            }
+                        );
+                        break;
+                    }
+
+                    if let Message::Assistant { content, thinking, tool_calls, .. } = response.message {
+                        if let Some(thinking_content) = thinking
+                            && !thinking_content.is_empty() {
+                            thinking_response += &thinking_content;
+                            yield RawStreamingChoice::Reasoning {
+                                reasoning: thinking_content,
+                                id: None,
+                                signature: None,
+                            };
+                        }
+
+                        if !content.is_empty() {
+                            text_response += &content;
+                            yield RawStreamingChoice::Message(content);
+                        }
+
+                        for tool_call in tool_calls {
+                            tool_calls_final.push(tool_call.clone());
+                            yield RawStreamingChoice::ToolCall {
+                                id: String::new(),
+                                name: tool_call.function.name,
+                                arguments: tool_call.function.arguments,
+                                call_id: None,
+                            };
+                        }
                     }
                 }
             }
-        });
+        }.instrument(span);
 
-        Ok(streaming::StreamingCompletionResponse::stream(stream))
+        Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
+            stream,
+        )))
     }
 }
 
@@ -673,7 +792,6 @@ impl From<crate::completion::ToolDefinition> for ToolDefinition {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct ToolCall {
-    // pub id: String,
     #[serde(default, rename = "type")]
     pub r#type: ToolType,
     pub function: Function,
@@ -780,11 +898,16 @@ impl TryFrom<crate::message::Message> for Vec<Message> {
                                     text,
                                 }) => texts.push(text),
                                 crate::message::UserContent::Image(crate::message::Image {
-                                    data,
+                                    data: DocumentSourceKind::Base64(data),
                                     ..
                                 }) => images.push(data),
                                 crate::message::UserContent::Document(
-                                    crate::message::Document { data, .. },
+                                    crate::message::Document {
+                                        data:
+                                            DocumentSourceKind::Base64(data)
+                                            | DocumentSourceKind::String(data),
+                                        ..
+                                    },
                                 ) => texts.push(data),
                                 _ => {} // Audio not supported by Ollama
                             }
@@ -797,7 +920,12 @@ impl TryFrom<crate::message::Message> for Vec<Message> {
                         images: if images.is_empty() {
                             None
                         } else {
-                            Some(images)
+                            Some(
+                                images
+                                    .into_iter()
+                                    .map(|x| x.to_string())
+                                    .collect::<Vec<String>>(),
+                            )
                         },
                         name: None,
                     }])
@@ -1096,5 +1224,238 @@ mod tests {
         // Check JSON fields in parameters.
         let params = &ollama_tool.function.parameters;
         assert_eq!(params["properties"]["location"]["type"], "string");
+    }
+
+    // Test deserialization of chat response with thinking content
+    #[tokio::test]
+    async fn test_chat_completion_with_thinking() {
+        let sample_response = json!({
+            "model": "qwen-thinking",
+            "created_at": "2023-08-04T19:22:45.499127Z",
+            "message": {
+                "role": "assistant",
+                "content": "The answer is 42.",
+                "thinking": "Let me think about this carefully. The question asks for the meaning of life...",
+                "images": null,
+                "tool_calls": []
+            },
+            "done": true,
+            "total_duration": 8000000000u64,
+            "load_duration": 6000000u64,
+            "prompt_eval_count": 61u64,
+            "prompt_eval_duration": 400000000u64,
+            "eval_count": 468u64,
+            "eval_duration": 7700000000u64
+        });
+
+        let chat_resp: CompletionResponse =
+            serde_json::from_value(sample_response).expect("Failed to deserialize");
+
+        // Verify thinking field is present
+        if let Message::Assistant {
+            thinking, content, ..
+        } = &chat_resp.message
+        {
+            assert_eq!(
+                thinking.as_ref().unwrap(),
+                "Let me think about this carefully. The question asks for the meaning of life..."
+            );
+            assert_eq!(content, "The answer is 42.");
+        } else {
+            panic!("Expected Assistant message");
+        }
+    }
+
+    // Test deserialization of chat response without thinking content
+    #[tokio::test]
+    async fn test_chat_completion_without_thinking() {
+        let sample_response = json!({
+            "model": "llama3.2",
+            "created_at": "2023-08-04T19:22:45.499127Z",
+            "message": {
+                "role": "assistant",
+                "content": "Hello!",
+                "images": null,
+                "tool_calls": []
+            },
+            "done": true,
+            "total_duration": 8000000000u64,
+            "load_duration": 6000000u64,
+            "prompt_eval_count": 10u64,
+            "prompt_eval_duration": 400000000u64,
+            "eval_count": 5u64,
+            "eval_duration": 7700000000u64
+        });
+
+        let chat_resp: CompletionResponse =
+            serde_json::from_value(sample_response).expect("Failed to deserialize");
+
+        // Verify thinking field is None when not provided
+        if let Message::Assistant {
+            thinking, content, ..
+        } = &chat_resp.message
+        {
+            assert!(thinking.is_none());
+            assert_eq!(content, "Hello!");
+        } else {
+            panic!("Expected Assistant message");
+        }
+    }
+
+    // Test deserialization of streaming response with thinking content
+    #[test]
+    fn test_streaming_response_with_thinking() {
+        let sample_chunk = json!({
+            "model": "qwen-thinking",
+            "created_at": "2023-08-04T19:22:45.499127Z",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "thinking": "Analyzing the problem...",
+                "images": null,
+                "tool_calls": []
+            },
+            "done": false
+        });
+
+        let chunk: CompletionResponse =
+            serde_json::from_value(sample_chunk).expect("Failed to deserialize");
+
+        if let Message::Assistant {
+            thinking, content, ..
+        } = &chunk.message
+        {
+            assert_eq!(thinking.as_ref().unwrap(), "Analyzing the problem...");
+            assert_eq!(content, "");
+        } else {
+            panic!("Expected Assistant message");
+        }
+    }
+
+    // Test message conversion with thinking content
+    #[test]
+    fn test_message_conversion_with_thinking() {
+        // Create an internal message with reasoning content
+        let reasoning_content = crate::message::Reasoning {
+            id: None,
+            reasoning: vec!["Step 1: Consider the problem".to_string()],
+            signature: None,
+        };
+
+        let internal_msg = crate::message::Message::Assistant {
+            id: None,
+            content: crate::OneOrMany::many(vec![
+                crate::message::AssistantContent::Reasoning(reasoning_content),
+                crate::message::AssistantContent::Text(crate::message::Text {
+                    text: "The answer is X".to_string(),
+                }),
+            ])
+            .unwrap(),
+        };
+
+        // Convert to provider Message
+        let provider_msgs: Vec<Message> = internal_msg.try_into().unwrap();
+        assert_eq!(provider_msgs.len(), 1);
+
+        if let Message::Assistant {
+            thinking, content, ..
+        } = &provider_msgs[0]
+        {
+            assert_eq!(thinking.as_ref().unwrap(), "Step 1: Consider the problem");
+            assert_eq!(content, "The answer is X");
+        } else {
+            panic!("Expected Assistant message with thinking");
+        }
+    }
+
+    // Test empty thinking content is handled correctly
+    #[test]
+    fn test_empty_thinking_content() {
+        let sample_response = json!({
+            "model": "llama3.2",
+            "created_at": "2023-08-04T19:22:45.499127Z",
+            "message": {
+                "role": "assistant",
+                "content": "Response",
+                "thinking": "",
+                "images": null,
+                "tool_calls": []
+            },
+            "done": true,
+            "total_duration": 8000000000u64,
+            "load_duration": 6000000u64,
+            "prompt_eval_count": 10u64,
+            "prompt_eval_duration": 400000000u64,
+            "eval_count": 5u64,
+            "eval_duration": 7700000000u64
+        });
+
+        let chat_resp: CompletionResponse =
+            serde_json::from_value(sample_response).expect("Failed to deserialize");
+
+        if let Message::Assistant {
+            thinking, content, ..
+        } = &chat_resp.message
+        {
+            // Empty string should still deserialize as Some("")
+            assert_eq!(thinking.as_ref().unwrap(), "");
+            assert_eq!(content, "Response");
+        } else {
+            panic!("Expected Assistant message");
+        }
+    }
+
+    // Test thinking with tool calls
+    #[test]
+    fn test_thinking_with_tool_calls() {
+        let sample_response = json!({
+            "model": "qwen-thinking",
+            "created_at": "2023-08-04T19:22:45.499127Z",
+            "message": {
+                "role": "assistant",
+                "content": "Let me check the weather.",
+                "thinking": "User wants weather info, I should use the weather tool",
+                "images": null,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {
+                                "location": "San Francisco"
+                            }
+                        }
+                    }
+                ]
+            },
+            "done": true,
+            "total_duration": 8000000000u64,
+            "load_duration": 6000000u64,
+            "prompt_eval_count": 30u64,
+            "prompt_eval_duration": 400000000u64,
+            "eval_count": 50u64,
+            "eval_duration": 7700000000u64
+        });
+
+        let chat_resp: CompletionResponse =
+            serde_json::from_value(sample_response).expect("Failed to deserialize");
+
+        if let Message::Assistant {
+            thinking,
+            content,
+            tool_calls,
+            ..
+        } = &chat_resp.message
+        {
+            assert_eq!(
+                thinking.as_ref().unwrap(),
+                "User wants weather info, I should use the weather tool"
+            );
+            assert_eq!(content, "Let me check the weather.");
+            assert_eq!(tool_calls.len(), 1);
+            assert_eq!(tool_calls[0].function.name, "get_weather");
+        } else {
+            panic!("Expected Assistant message with thinking and tool calls");
+        }
     }
 }

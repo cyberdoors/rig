@@ -28,9 +28,13 @@ pub const GEMINI_1_5_PRO_8B: &str = "gemini-1.5-pro-8b";
 pub const GEMINI_1_0_PRO: &str = "gemini-1.0-pro";
 
 use self::gemini_api_types::Schema;
+use crate::http_client::HttpClientExt;
 use crate::message::Reasoning;
-use crate::providers::gemini::completion::gemini_api_types::AdditionalParameters;
+use crate::providers::gemini::completion::gemini_api_types::{
+    AdditionalParameters, FunctionCallingMode, ToolConfig,
+};
 use crate::providers::gemini::streaming::StreamingCompletionResponse;
+use crate::telemetry::SpanCombinator;
 use crate::{
     OneOrMany,
     completion::{self, CompletionError, CompletionRequest},
@@ -41,6 +45,7 @@ use gemini_api_types::{
 };
 use serde_json::{Map, Value};
 use std::convert::TryFrom;
+use tracing::info_span;
 
 use super::Client;
 
@@ -49,13 +54,13 @@ use super::Client;
 // =================================================================
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub(crate) client: Client<T>,
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T> {
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -63,7 +68,10 @@ impl CompletionModel {
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + 'static,
+{
     type Response = GenerateContentResponse;
     type StreamingResponse = StreamingCompletionResponse;
 
@@ -72,22 +80,54 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<GenerateContentResponse>, CompletionError> {
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "generate_content",
+                gen_ai.operation.name = "generate_content",
+                gen_ai.provider.name = "gcp.gemini",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = &completion_request.preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = tracing::field::Empty,
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
         let request = create_request_body(completion_request)?;
+        span.record_model_input(&request.contents);
+
+        span.record_model_input(&request.contents);
 
         tracing::debug!(
             "Sending completion request to Gemini API {}",
             serde_json::to_string_pretty(&request)?
         );
 
-        let response = self
+        let body = serde_json::to_vec(&request)?;
+
+        let request = self
             .client
             .post(&format!("/v1beta/models/{}:generateContent", self.model))
-            .json(&request)
-            .send()
-            .await?;
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+        let response = self.client.send::<_, Vec<u8>>(request).await?;
 
         if response.status().is_success() {
-            let response = response.json::<GenerateContentResponse>().await?;
+            let response_body = response
+                .into_body()
+                .await
+                .map_err(CompletionError::HttpError)?;
+
+            let response: GenerateContentResponse = serde_json::from_slice(&response_body)?;
+
             match response.usage_metadata {
                 Some(ref usage) => tracing::info!(target: "rig",
                 "Gemini completion token usage: {}",
@@ -98,12 +138,28 @@ impl completion::CompletionModel for CompletionModel {
                 ),
             }
 
-            tracing::debug!("Received response");
+            let span = tracing::Span::current();
+            span.record_model_output(&response.candidates);
+            span.record_response_metadata(&response);
+            span.record_token_usage(&response.usage_metadata);
 
-            Ok(completion::CompletionResponse::try_from(response))
+            tracing::debug!(
+                "Received response from Gemini API: {}",
+                serde_json::to_string_pretty(&response)?
+            );
+
+            response.try_into()
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
-        }?
+            let text = String::from_utf8_lossy(
+                &response
+                    .into_body()
+                    .await
+                    .map_err(CompletionError::HttpError)?,
+            )
+            .into();
+
+            Err(CompletionError::ProviderError(text))
+        }
     }
 
     #[cfg_attr(feature = "worker", worker::send)]
@@ -152,6 +208,14 @@ pub(crate) fn create_request_body(
         Some(Tool::try_from(completion_request.tools)?)
     };
 
+    let tool_config = if let Some(cfg) = completion_request.tool_choice {
+        Some(ToolConfig {
+            function_calling_config: Some(FunctionCallingMode::try_from(cfg)?),
+        })
+    } else {
+        None
+    };
+
     let request = GenerateContentRequest {
         contents: full_history
             .into_iter()
@@ -163,7 +227,7 @@ pub(crate) fn create_request_body(
         generation_config: Some(generation_config),
         safety_settings: None,
         tools,
-        tool_config: None,
+        tool_config,
         system_instruction,
         additional_params,
     };
@@ -280,7 +344,7 @@ impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<Generat
             .as_ref()
             .map(|usage| completion::Usage {
                 input_tokens: usage.prompt_token_count as u64,
-                output_tokens: usage.candidates_token_count as u64,
+                output_tokens: usage.candidates_token_count.unwrap_or(0) as u64,
                 total_tokens: usage.total_token_count as u64,
             })
             .unwrap_or_default();
@@ -294,6 +358,7 @@ impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<Generat
 }
 
 pub mod gemini_api_types {
+    use crate::telemetry::ProviderResponseExt;
     use std::{collections::HashMap, convert::Infallible, str::FromStr};
 
     // =================================================================
@@ -302,11 +367,12 @@ pub mod gemini_api_types {
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
 
-    use crate::message::ContentFormat;
+    use crate::completion::GetTokenUsage;
+    use crate::message::{DocumentSourceKind, ImageMediaType, MessageError, MimeType};
     use crate::{
         OneOrMany,
         completion::CompletionError,
-        message::{self, MimeType as _, Reasoning, Text},
+        message::{self, Reasoning, Text},
         providers::gemini::gemini_api_types::{CodeExecutionResult, ExecutableCode},
     };
 
@@ -342,6 +408,7 @@ pub mod gemini_api_types {
     #[derive(Debug, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct GenerateContentResponse {
+        pub response_id: String,
         /// Candidate responses from the model.
         pub candidates: Vec<ContentCandidate>,
         /// Returns the prompt's feedback related to the content filters.
@@ -351,8 +418,60 @@ pub mod gemini_api_types {
         pub model_version: Option<String>,
     }
 
+    impl ProviderResponseExt for GenerateContentResponse {
+        type OutputMessage = ContentCandidate;
+        type Usage = UsageMetadata;
+
+        fn get_response_id(&self) -> Option<String> {
+            Some(self.response_id.clone())
+        }
+
+        fn get_response_model_name(&self) -> Option<String> {
+            None
+        }
+
+        fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
+            self.candidates.clone()
+        }
+
+        fn get_text_response(&self) -> Option<String> {
+            let str = self
+                .candidates
+                .iter()
+                .filter_map(|x| {
+                    if x.content.role.as_ref().is_none_or(|y| y != &Role::Model) {
+                        return None;
+                    }
+
+                    let res = x
+                        .content
+                        .parts
+                        .iter()
+                        .filter_map(|part| {
+                            if let PartKind::Text(ref str) = part.part {
+                                Some(str.to_owned())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<String>>()
+                        .join("\n");
+
+                    Some(res)
+                })
+                .collect::<Vec<String>>()
+                .join("\n");
+
+            if str.is_empty() { None } else { Some(str) }
+        }
+
+        fn get_usage(&self) -> Option<Self::Usage> {
+            self.usage_metadata.clone()
+        }
+    }
+
     /// A response candidate generated from the model.
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct ContentCandidate {
         /// Output only. Generated content returned from the model.
@@ -377,7 +496,7 @@ pub mod gemini_api_types {
         pub index: Option<i32>,
     }
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct Content {
         /// Ordered Parts that constitute a single message. Parts may have different MIME types.
         #[serde(default)]
@@ -425,9 +544,8 @@ pub mod gemini_api_types {
 
                                         match mime_type {
                                             Some(message::MediaType::Image(media_type)) => {
-                                                message::UserContent::image(
+                                                message::UserContent::image_base64(
                                                     inline_data.data,
-                                                    Some(message::ContentFormat::default()),
                                                     Some(media_type),
                                                     Some(message::ImageDetail::default()),
                                                 )
@@ -435,14 +553,12 @@ pub mod gemini_api_types {
                                             Some(message::MediaType::Document(media_type)) => {
                                                 message::UserContent::document(
                                                     inline_data.data,
-                                                    Some(message::ContentFormat::default()),
                                                     Some(media_type),
                                                 )
                                             }
                                             Some(message::MediaType::Audio(media_type)) => {
                                                 message::UserContent::audio(
                                                     inline_data.data,
-                                                    Some(message::ContentFormat::default()),
                                                     Some(media_type),
                                                 )
                                             }
@@ -513,7 +629,7 @@ pub mod gemini_api_types {
         Model,
     }
 
-    #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+    #[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
     #[serde(rename_all = "camelCase")]
     pub struct Part {
         /// whether or not the part is a reasoning/thinking text or not
@@ -543,6 +659,14 @@ pub mod gemini_api_types {
         CodeExecutionResult(CodeExecutionResult),
     }
 
+    // This default instance is primarily so we can easily fill in the optional fields of `Part`
+    // So this instance for `PartKind` (and the allocation it would cause) should be optimized away
+    impl Default for PartKind {
+        fn default() -> Self {
+            Self::Text(String::new())
+        }
+    }
+
     impl From<String> for Part {
         fn from(text: String) -> Self {
             Self {
@@ -565,6 +689,36 @@ pub mod gemini_api_types {
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             Ok(s.into())
+        }
+    }
+
+    impl TryFrom<(ImageMediaType, DocumentSourceKind)> for PartKind {
+        type Error = message::MessageError;
+        fn try_from(
+            (mime_type, doc_src): (ImageMediaType, DocumentSourceKind),
+        ) -> Result<Self, Self::Error> {
+            let mime_type = mime_type.to_mime_type().to_string();
+            let part = match doc_src {
+                DocumentSourceKind::Url(url) => PartKind::FileData(FileData {
+                    mime_type: Some(mime_type),
+                    file_uri: url,
+                }),
+                DocumentSourceKind::Base64(data) | DocumentSourceKind::String(data) => {
+                    PartKind::InlineData(Blob { mime_type, data })
+                }
+                DocumentSourceKind::Raw(_) => {
+                    return Err(message::MessageError::ConversionError(
+                        "Raw files not supported, encode as base64 first".into(),
+                    ));
+                }
+                DocumentSourceKind::Unknown => {
+                    return Err(message::MessageError::ConversionError(
+                        "Can't convert an unknown document source".to_string(),
+                    ));
+                }
+            };
+
+            Ok(part)
         }
     }
 
@@ -615,94 +769,169 @@ pub mod gemini_api_types {
                         | message::ImageMediaType::PNG
                         | message::ImageMediaType::WEBP
                         | message::ImageMediaType::HEIC
-                        | message::ImageMediaType::HEIF => Ok(Part {
-                            thought: Some(false),
-                            thought_signature: None,
-                            part: PartKind::InlineData(Blob {
-                                mime_type: media_type.to_mime_type().to_owned(),
-                                data,
-                            }),
-                            additional_params: None,
-                        }),
+                        | message::ImageMediaType::HEIF => {
+                            let part = PartKind::try_from((media_type, data))?;
+                            Ok(Part {
+                                thought: Some(false),
+                                thought_signature: None,
+                                part,
+                                additional_params: None,
+                            })
+                        }
                         _ => Err(message::MessageError::ConversionError(format!(
                             "Unsupported image media type {media_type:?}"
                         ))),
                     },
                     None => Err(message::MessageError::ConversionError(
-                        "Media type for image is required for Gemini".to_string(), // Fixed error message
+                        "Media type for image is required for Gemini".to_string(),
                     )),
                 },
                 message::UserContent::Document(message::Document {
                     data, media_type, ..
-                }) => match media_type {
-                    Some(media_type) => match media_type {
-                        message::DocumentMediaType::PDF
-                        | message::DocumentMediaType::TXT
-                        | message::DocumentMediaType::RTF
-                        | message::DocumentMediaType::HTML
-                        | message::DocumentMediaType::CSS
-                        | message::DocumentMediaType::MARKDOWN
-                        | message::DocumentMediaType::CSV
-                        | message::DocumentMediaType::XML => Ok(Part {
-                            thought: Some(false),
-                            thought_signature: None,
-                            part: PartKind::InlineData(Blob {
-                                mime_type: media_type.to_mime_type().to_owned(),
-                                data,
+                }) => {
+                    let Some(media_type) = media_type else {
+                        return Err(MessageError::ConversionError(
+                            "A mime type is required for document inputs to Gemini".to_string(),
+                        ));
+                    };
+
+                    if !media_type.is_code() {
+                        let mime_type = media_type.to_mime_type().to_string();
+
+                        let part = match data {
+                            DocumentSourceKind::Url(file_uri) => PartKind::FileData(FileData {
+                                mime_type: Some(mime_type),
+                                file_uri,
                             }),
-                            additional_params: None,
-                        }),
-                        _ => Err(message::MessageError::ConversionError(format!(
+                            DocumentSourceKind::Base64(data) | DocumentSourceKind::String(data) => {
+                                PartKind::InlineData(Blob { mime_type, data })
+                            }
+                            DocumentSourceKind::Raw(_) => {
+                                return Err(message::MessageError::ConversionError(
+                                    "Raw files not supported, encode as base64 first".into(),
+                                ));
+                            }
+                            _ => {
+                                return Err(message::MessageError::ConversionError(
+                                    "Document has no body".to_string(),
+                                ));
+                            }
+                        };
+
+                        Ok(Part {
+                            thought: Some(false),
+                            part,
+                            ..Default::default()
+                        })
+                    } else {
+                        Err(message::MessageError::ConversionError(format!(
                             "Unsupported document media type {media_type:?}"
-                        ))),
-                    },
-                    None => Err(message::MessageError::ConversionError(
-                        "Media type for document is required for Gemini".to_string(), // Fixed error message
-                    )),
-                },
+                        )))
+                    }
+                }
+
                 message::UserContent::Audio(message::Audio {
                     data, media_type, ..
-                }) => match media_type {
-                    Some(media_type) => Ok(Part {
-                        thought: Some(false),
-                        thought_signature: None,
-                        part: PartKind::InlineData(Blob {
-                            mime_type: media_type.to_mime_type().to_owned(),
-                            data,
+                }) => {
+                    let Some(media_type) = media_type else {
+                        return Err(MessageError::ConversionError(
+                            "A mime type is required for audio inputs to Gemini".to_string(),
+                        ));
+                    };
+
+                    let mime_type = media_type.to_mime_type().to_string();
+
+                    let part = match data {
+                        DocumentSourceKind::Base64(data) => {
+                            PartKind::InlineData(Blob { data, mime_type })
+                        }
+
+                        DocumentSourceKind::Url(file_uri) => PartKind::FileData(FileData {
+                            mime_type: Some(mime_type),
+                            file_uri,
                         }),
-                        additional_params: None,
-                    }),
-                    None => Err(message::MessageError::ConversionError(
-                        "Media type for audio is required for Gemini".to_string(),
-                    )),
-                },
+                        DocumentSourceKind::String(_) => {
+                            return Err(message::MessageError::ConversionError(
+                                "Strings cannot be used as audio files!".into(),
+                            ));
+                        }
+                        DocumentSourceKind::Raw(_) => {
+                            return Err(message::MessageError::ConversionError(
+                                "Raw files not supported, encode as base64 first".into(),
+                            ));
+                        }
+                        DocumentSourceKind::Unknown => {
+                            return Err(message::MessageError::ConversionError(
+                                "Content has no body".to_string(),
+                            ));
+                        }
+                    };
+
+                    Ok(Part {
+                        thought: Some(false),
+                        part,
+                        ..Default::default()
+                    })
+                }
                 message::UserContent::Video(message::Video {
                     data,
                     media_type,
-                    format,
                     additional_params,
+                    ..
                 }) => {
-                    let mime_type = media_type.map(|m| m.to_mime_type().to_owned());
+                    let mime_type = media_type.map(|media_ty| media_ty.to_mime_type().to_string());
 
-                    let data = match format {
-                        Some(ContentFormat::String) => PartKind::FileData(FileData {
-                            mime_type,
-                            file_uri: data,
-                        }),
-                        _ => match mime_type {
-                            Some(mime_type) => PartKind::InlineData(Blob { mime_type, data }),
-                            None => {
-                                return Err(message::MessageError::ConversionError(
-                                    "Media type for video is required for Gemini".to_string(),
-                                ));
+                    let part = match data {
+                        DocumentSourceKind::Url(file_uri) => {
+                            if file_uri.starts_with("https://www.youtube.com") {
+                                PartKind::FileData(FileData {
+                                    mime_type,
+                                    file_uri,
+                                })
+                            } else {
+                                if mime_type.is_none() {
+                                    return Err(MessageError::ConversionError(
+                                        "A mime type is required for non-Youtube video file inputs to Gemini"
+                                            .to_string(),
+                                    ));
+                                }
+
+                                PartKind::FileData(FileData {
+                                    mime_type,
+                                    file_uri,
+                                })
                             }
-                        },
+                        }
+                        DocumentSourceKind::Base64(data) => {
+                            let Some(mime_type) = mime_type else {
+                                return Err(MessageError::ConversionError(
+                                    "A media type is expected for base64 encoded strings"
+                                        .to_string(),
+                                ));
+                            };
+                            PartKind::InlineData(Blob { mime_type, data })
+                        }
+                        DocumentSourceKind::String(_) => {
+                            return Err(message::MessageError::ConversionError(
+                                "Strings cannot be used as audio files!".into(),
+                            ));
+                        }
+                        DocumentSourceKind::Raw(_) => {
+                            return Err(message::MessageError::ConversionError(
+                                "Raw file data not supported, encode as base64 first".into(),
+                            ));
+                        }
+                        DocumentSourceKind::Unknown => {
+                            return Err(message::MessageError::ConversionError(
+                                "Media type for video is required for Gemini".to_string(),
+                            ));
+                        }
                     };
 
                     Ok(Part {
                         thought: Some(false),
                         thought_signature: None,
-                        part: data,
+                        part,
                         additional_params,
                     })
                 }
@@ -849,7 +1078,8 @@ pub mod gemini_api_types {
         pub prompt_token_count: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cached_content_token_count: Option<i32>,
-        pub candidates_token_count: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub candidates_token_count: Option<i32>,
         pub total_token_count: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub thoughts_token_count: Option<i32>,
@@ -865,9 +1095,27 @@ pub mod gemini_api_types {
                     Some(count) => count.to_string(),
                     None => "n/a".to_string(),
                 },
-                self.candidates_token_count,
+                match self.candidates_token_count {
+                    Some(count) => count.to_string(),
+                    None => "n/a".to_string(),
+                },
                 self.total_token_count
             )
+        }
+    }
+
+    impl GetTokenUsage for UsageMetadata {
+        fn token_usage(&self) -> Option<crate::completion::Usage> {
+            let mut usage = crate::completion::Usage::new();
+
+            usage.input_tokens = self.prompt_token_count as u64;
+            usage.output_tokens = (self.cached_content_token_count.unwrap_or_default()
+                + self.candidates_token_count.unwrap_or_default()
+                + self.thoughts_token_count.unwrap_or_default())
+                as u64;
+            usage.total_tokens = usage.input_tokens + usage.output_tokens;
+
+            Some(usage)
         }
     }
 
@@ -897,7 +1145,7 @@ pub mod gemini_api_types {
         ProhibitedContent,
     }
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum FinishReason {
         /// Default value. This value is unused.
@@ -924,13 +1172,13 @@ pub mod gemini_api_types {
         MalformedFunctionCall,
     }
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct CitationMetadata {
         pub citation_sources: Vec<CitationSource>,
     }
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct CitationSource {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -943,19 +1191,19 @@ pub mod gemini_api_types {
         pub license: Option<String>,
     }
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct LogprobsResult {
         pub top_candidate: Vec<TopCandidate>,
         pub chosen_candidate: Vec<LogProbCandidate>,
     }
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct TopCandidate {
         pub candidates: Vec<LogProbCandidate>,
     }
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct LogProbCandidate {
         pub token: String,
@@ -1191,27 +1439,133 @@ pub mod gemini_api_types {
         }
     }
 
+    /// Helper function to extract the type string from a JSON value.
+    /// Handles both direct string types and array types (returns the first element).
+    fn extract_type(type_value: &Value) -> Option<String> {
+        if type_value.is_string() {
+            type_value.as_str().map(String::from)
+        } else if type_value.is_array() {
+            type_value
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str().map(String::from))
+        } else {
+            None
+        }
+    }
+
+    /// Helper function to extract type from anyOf, oneOf, or allOf schemas.
+    /// Returns the type of the first non-null schema found.
+    fn extract_type_from_composition(composition: &Value) -> Option<String> {
+        composition.as_array().and_then(|arr| {
+            arr.iter().find_map(|schema| {
+                if let Some(obj) = schema.as_object() {
+                    // Skip null types
+                    if let Some(type_val) = obj.get("type")
+                        && let Some(type_str) = type_val.as_str()
+                        && type_str == "null"
+                    {
+                        return None;
+                    }
+                    // Extract type from this schema
+                    obj.get("type").and_then(extract_type).or_else(|| {
+                        if obj.contains_key("properties") {
+                            Some("object".to_string())
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    /// Helper function to extract the first non-null schema from anyOf, oneOf, or allOf.
+    /// Returns the schema object that should be used for properties, required, etc.
+    fn extract_schema_from_composition(
+        composition: &Value,
+    ) -> Option<serde_json::Map<String, Value>> {
+        composition.as_array().and_then(|arr| {
+            arr.iter().find_map(|schema| {
+                if let Some(obj) = schema.as_object()
+                    && let Some(type_val) = obj.get("type")
+                    && let Some(type_str) = type_val.as_str()
+                {
+                    if type_str == "null" {
+                        return None;
+                    }
+                    Some(obj.clone())
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    /// Helper function to infer the type of a schema object.
+    /// Checks for explicit type, then anyOf/oneOf/allOf, then infers from properties.
+    fn infer_type(obj: &serde_json::Map<String, Value>) -> String {
+        // First, try direct type field
+        if let Some(type_val) = obj.get("type")
+            && let Some(type_str) = extract_type(type_val)
+        {
+            return type_str;
+        }
+
+        // Then try anyOf, oneOf, allOf (in that order)
+        if let Some(any_of) = obj.get("anyOf")
+            && let Some(type_str) = extract_type_from_composition(any_of)
+        {
+            return type_str;
+        }
+
+        if let Some(one_of) = obj.get("oneOf")
+            && let Some(type_str) = extract_type_from_composition(one_of)
+        {
+            return type_str;
+        }
+
+        if let Some(all_of) = obj.get("allOf")
+            && let Some(type_str) = extract_type_from_composition(all_of)
+        {
+            return type_str;
+        }
+
+        // Finally, infer object type if properties are present
+        if obj.contains_key("properties") {
+            "object".to_string()
+        } else {
+            String::new()
+        }
+    }
+
     impl TryFrom<Value> for Schema {
         type Error = CompletionError;
 
         fn try_from(value: Value) -> Result<Self, Self::Error> {
             let flattened_val = flatten_schema(value)?;
             if let Some(obj) = flattened_val.as_object() {
+                // Determine which object to use for extracting properties and required fields.
+                // If this object has anyOf/oneOf/allOf, we need to extract properties from the composition.
+                let props_source = if obj.get("properties").is_none() {
+                    if let Some(any_of) = obj.get("anyOf") {
+                        extract_schema_from_composition(any_of)
+                    } else if let Some(one_of) = obj.get("oneOf") {
+                        extract_schema_from_composition(one_of)
+                    } else if let Some(all_of) = obj.get("allOf") {
+                        extract_schema_from_composition(all_of)
+                    } else {
+                        None
+                    }
+                    .unwrap_or(obj.clone())
+                } else {
+                    obj.clone()
+                };
+
                 Ok(Schema {
-                    r#type: obj
-                        .get("type")
-                        .and_then(|v| {
-                            if v.is_string() {
-                                v.as_str().map(String::from)
-                            } else if v.is_array() {
-                                v.as_array()
-                                    .and_then(|arr| arr.first())
-                                    .and_then(|v| v.as_str().map(String::from))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default(),
+                    r#type: infer_type(obj),
                     format: obj.get("format").and_then(|v| v.as_str()).map(String::from),
                     description: obj
                         .get("description")
@@ -1231,7 +1585,7 @@ pub mod gemini_api_types {
                         .get("minItems")
                         .and_then(|v| v.as_i64())
                         .map(|v| v as i32),
-                    properties: obj
+                    properties: props_source
                         .get("properties")
                         .and_then(|v| v.as_object())
                         .map(|map| {
@@ -1241,14 +1595,18 @@ pub mod gemini_api_types {
                                 })
                                 .collect()
                         }),
-                    required: obj.get("required").and_then(|v| v.as_array()).map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    }),
+                    required: props_source
+                        .get("required")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        }),
                     items: obj
                         .get("items")
-                        .map(|v| Box::new(v.clone().try_into().unwrap())),
+                        .and_then(|v| v.clone().try_into().ok())
+                        .map(Box::new),
                 })
             } else {
                 Err(CompletionError::ResponseError(
@@ -1306,14 +1664,43 @@ pub mod gemini_api_types {
         pub parameters: Option<Schema>,
     }
 
-    #[derive(Debug, Serialize)]
+    #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct ToolConfig {
-        pub schema: Option<Schema>,
+        pub function_calling_config: Option<FunctionCallingMode>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    #[serde(tag = "mode", rename_all = "UPPERCASE")]
+    pub enum FunctionCallingMode {
+        #[default]
+        Auto,
+        None,
+        Any {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            allowed_function_names: Option<Vec<String>>,
+        },
+    }
+
+    impl TryFrom<message::ToolChoice> for FunctionCallingMode {
+        type Error = CompletionError;
+        fn try_from(value: message::ToolChoice) -> Result<Self, Self::Error> {
+            let res = match value {
+                message::ToolChoice::Auto => Self::Auto,
+                message::ToolChoice::None => Self::None,
+                message::ToolChoice::Required => Self::Any {
+                    allowed_function_names: None,
+                },
+                message::ToolChoice::Specific { function_names } => Self::Any {
+                    allowed_function_names: Some(function_names),
+                },
+            };
+
+            Ok(res)
+        }
     }
 
     #[derive(Debug, Serialize)]
-    #[serde(rename_all = "camelCase")]
     pub struct CodeExecution {}
 
     #[derive(Debug, Serialize)]

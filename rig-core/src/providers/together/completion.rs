@@ -5,6 +5,7 @@
 
 use crate::{
     completion::{self, CompletionError},
+    http_client::HttpClientExt,
     json_utils,
     providers::openai,
 };
@@ -12,7 +13,10 @@ use crate::{
 use super::client::{Client, together_ai_api_types::ApiResponse};
 use crate::completion::CompletionRequest;
 use crate::streaming::StreamingCompletionResponse;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::{Instrument, info_span};
 
 // ================================================================
 // Together Completion Models
@@ -128,13 +132,13 @@ pub const WIZARDLM_13B_V1_2: &str = "WizardLM/WizardLM-13B-V1.2";
 // =================================================================
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub(crate) client: Client<T>,
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T> {
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -164,6 +168,11 @@ impl CompletionModel {
 
         full_history.extend(chat_history);
 
+        let tool_choice = completion_request
+            .tool_choice
+            .map(ToolChoice::try_from)
+            .transpose()?;
+
         let mut request = if completion_request.tools.is_empty() {
             json!({
                 "model": self.model,
@@ -176,7 +185,7 @@ impl CompletionModel {
                 "messages": full_history,
                 "temperature": completion_request.temperature,
                 "tools": completion_request.tools.into_iter().map(openai::ToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
             })
         };
         request = if let Some(params) = completion_request.additional_params {
@@ -188,7 +197,10 @@ impl CompletionModel {
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
+{
     type Response = openai::CompletionResponse;
     type StreamingResponse = openai::StreamingCompletionResponse;
 
@@ -197,32 +209,76 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse<openai::CompletionResponse>, CompletionError> {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
+        let messages_as_json_string =
+            serde_json::to_string(request.get("messages").unwrap()).unwrap();
 
-        let response = self
-            .client
-            .post("/v1/chat/completions")
-            .json(&request)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            let t = response.text().await?;
-            tracing::debug!(target: "rig", "Together completion error: {}", t);
-
-            match serde_json::from_str::<ApiResponse<openai::CompletionResponse>>(&t)? {
-                ApiResponse::Ok(response) => {
-                    tracing::info!(target: "rig",
-                        "Together completion token usage: {:?}",
-                        response.usage.clone().map(|usage| format!("{usage}")).unwrap_or("N/A".to_string())
-                    );
-                    response.try_into()
-                }
-                ApiResponse::Error(err) => Err(CompletionError::ProviderError(err.error)),
-            }
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "together",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = &messages_as_json_string,
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+            tracing::Span::current()
+        };
+
+        tracing::debug!(target: "rig::completion", "TogetherAI completion request: {messages_as_json_string}");
+
+        let body = serde_json::to_vec(&request)?;
+
+        let req = self
+            .client
+            .post("/v1/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|x| CompletionError::HttpError(x.into()))?;
+
+        async move {
+            let response = self.client.http_client.send::<_, Bytes>(req).await?;
+            let status = response.status();
+            let response_body = response.into_body().into_future().await?.to_vec();
+
+            if status.is_success() {
+                match serde_json::from_slice::<ApiResponse<openai::CompletionResponse>>(&response_body)? {
+                    ApiResponse::Ok(response) => {
+                        let span = tracing::Span::current();
+                        span.record(
+                            "gen_ai.output.messages",
+                            serde_json::to_string(&response.choices).unwrap(),
+                        );
+                        span.record("gen_ai.response.id", &response.id);
+                        span.record("gen_ai.response.model_name", &response.model);
+                        if let Some(ref usage) = response.usage {
+                            span.record("gen_ai.usage.input_tokens", usage.prompt_tokens);
+                            span.record(
+                                "gen_ai.usage.output_tokens",
+                                usage.total_tokens - usage.prompt_tokens,
+                            );
+                        }
+                        tracing::debug!(target: "rig::completion", "TogetherAI completion response: {}", serde_json::to_string_pretty(&response)?);
+                        response.try_into()
+                    }
+                    ApiResponse::Error(err) => Err(CompletionError::ProviderError(err.error)),
+                }
+            } else {
+                Err(CompletionError::ProviderError(
+                    String::from_utf8_lossy(&response_body).to_string()
+                ))
+            }
         }
+        .instrument(span)
+        .await
     }
 
     #[cfg_attr(feature = "worker", worker::send)]
@@ -232,4 +288,44 @@ impl completion::CompletionModel for CompletionModel {
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         CompletionModel::stream(self, request).await
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged, rename_all = "snake_case")]
+pub enum ToolChoice {
+    None,
+    Auto,
+    Function(Vec<ToolChoiceFunctionKind>),
+}
+
+impl TryFrom<crate::message::ToolChoice> for ToolChoice {
+    type Error = CompletionError;
+
+    fn try_from(value: crate::message::ToolChoice) -> Result<Self, Self::Error> {
+        let res = match value {
+            crate::message::ToolChoice::None => Self::None,
+            crate::message::ToolChoice::Auto => Self::Auto,
+            crate::message::ToolChoice::Specific { function_names } => {
+                let vec: Vec<ToolChoiceFunctionKind> = function_names
+                    .into_iter()
+                    .map(|name| ToolChoiceFunctionKind::Function { name })
+                    .collect();
+
+                Self::Function(vec)
+            }
+            choice => {
+                return Err(CompletionError::ProviderError(format!(
+                    "Unsupported tool choice type: {choice:?}"
+                )));
+            }
+        };
+
+        Ok(res)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "function")]
+pub enum ToolChoiceFunctionKind {
+    Function { name: String },
 }

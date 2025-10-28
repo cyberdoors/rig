@@ -1,12 +1,15 @@
 use crate::agent::Agent;
 use crate::client::ProviderClient;
+use crate::completion::{CompletionRequest, GetTokenUsage, Message, Usage};
 use crate::embeddings::embedding::EmbeddingModelDyn;
 use crate::providers::{
     anthropic, azure, cohere, deepseek, galadriel, gemini, groq, huggingface, hyperbolic, mira,
     moonshot, ollama, openai, openrouter, perplexity, together, xai,
 };
+use crate::streaming::StreamingCompletionResponse;
 use crate::transcription::TranscriptionModelDyn;
 use rig::completion::CompletionModelDyn;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use thiserror::Error;
@@ -78,93 +81,93 @@ impl<'a> DynClientBuilder {
         .register_all(vec![
             ClientFactory::new(
                 DefaultProviders::ANTHROPIC,
-                anthropic::Client::from_env_boxed,
-                anthropic::Client::from_val_boxed,
+                anthropic::Client::<reqwest::Client>::from_env_boxed,
+                anthropic::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::COHERE,
-                cohere::Client::from_env_boxed,
-                cohere::Client::from_val_boxed,
+                cohere::Client::<reqwest::Client>::from_env_boxed,
+                cohere::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::GEMINI,
-                gemini::Client::from_env_boxed,
-                gemini::Client::from_val_boxed,
+                gemini::Client::<reqwest::Client>::from_env_boxed,
+                gemini::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::HUGGINGFACE,
-                huggingface::Client::from_env_boxed,
-                huggingface::Client::from_val_boxed,
+                huggingface::Client::<reqwest::Client>::from_env_boxed,
+                huggingface::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::OPENAI,
-                openai::Client::from_env_boxed,
-                openai::Client::from_val_boxed,
+                openai::Client::<reqwest::Client>::from_env_boxed,
+                openai::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::OPENROUTER,
-                openrouter::Client::from_env_boxed,
-                openrouter::Client::from_val_boxed,
+                openrouter::Client::<reqwest::Client>::from_env_boxed,
+                openrouter::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::TOGETHER,
-                together::Client::from_env_boxed,
-                together::Client::from_val_boxed,
+                together::Client::<reqwest::Client>::from_env_boxed,
+                together::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::XAI,
-                xai::Client::from_env_boxed,
-                xai::Client::from_val_boxed,
+                xai::Client::<reqwest::Client>::from_env_boxed,
+                xai::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::AZURE,
-                azure::Client::from_env_boxed,
-                azure::Client::from_val_boxed,
+                azure::Client::<reqwest::Client>::from_env_boxed,
+                azure::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::DEEPSEEK,
-                deepseek::Client::from_env_boxed,
-                deepseek::Client::from_val_boxed,
+                deepseek::Client::<reqwest::Client>::from_env_boxed,
+                deepseek::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::GALADRIEL,
-                galadriel::Client::from_env_boxed,
-                galadriel::Client::from_val_boxed,
+                galadriel::Client::<reqwest::Client>::from_env_boxed,
+                galadriel::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::GROQ,
-                groq::Client::from_env_boxed,
-                groq::Client::from_val_boxed,
+                groq::Client::<reqwest::Client>::from_env_boxed,
+                groq::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::HYPERBOLIC,
-                hyperbolic::Client::from_env_boxed,
-                hyperbolic::Client::from_val_boxed,
+                hyperbolic::Client::<reqwest::Client>::from_env_boxed,
+                hyperbolic::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::MOONSHOT,
-                moonshot::Client::from_env_boxed,
-                moonshot::Client::from_val_boxed,
+                moonshot::Client::<reqwest::Client>::from_env_boxed,
+                moonshot::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::MIRA,
-                mira::Client::from_env_boxed,
-                mira::Client::from_val_boxed,
+                mira::Client::<reqwest::Client>::from_env_boxed,
+                mira::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::MISTRAL,
-                mistral::Client::from_env_boxed,
-                mistral::Client::from_val_boxed,
+                mistral::Client::<reqwest::Client>::from_env_boxed,
+                mistral::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::OLLAMA,
-                ollama::Client::from_env_boxed,
-                ollama::Client::from_val_boxed,
+                ollama::Client::<reqwest::Client>::from_env_boxed,
+                ollama::Client::<reqwest::Client>::from_val_boxed,
             ),
             ClientFactory::new(
                 DefaultProviders::PERPLEXITY,
-                perplexity::Client::from_env_boxed,
-                perplexity::Client::from_val_boxed,
+                perplexity::Client::<reqwest::Client>::from_env_boxed,
+                perplexity::Client::<reqwest::Client>::from_val_boxed,
             ),
         ])
     }
@@ -373,6 +376,136 @@ impl<'a> DynClientBuilder {
             model,
         })
     }
+
+    /// Stream a completion request to the specified provider and model.
+    ///
+    /// # Arguments
+    /// * `provider` - The name of the provider (e.g., "openai", "anthropic")
+    /// * `model` - The name of the model (e.g., "gpt-4o", "claude-3-sonnet")
+    /// * `request` - The completion request containing prompt, parameters, etc.
+    ///
+    /// # Returns
+    /// A future that resolves to a streaming completion response
+    pub async fn stream_completion(
+        &self,
+        provider: &str,
+        model: &str,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<FinalCompletionResponse>, ClientBuildError> {
+        let client = self.build(provider)?;
+        let completion = client
+            .as_completion()
+            .ok_or(ClientBuildError::UnsupportedFeature(
+                provider.to_string(),
+                "completion".to_string(),
+            ))?;
+
+        let model = completion.completion_model(model);
+        model
+            .stream(request)
+            .await
+            .map_err(|e| ClientBuildError::FactoryError(e.to_string()))
+    }
+
+    /// Stream a simple prompt to the specified provider and model.
+    ///
+    /// # Arguments
+    /// * `provider` - The name of the provider (e.g., "openai", "anthropic")
+    /// * `model` - The name of the model (e.g., "gpt-4o", "claude-3-sonnet")
+    /// * `prompt` - The prompt to send to the model
+    ///
+    /// # Returns
+    /// A future that resolves to a streaming completion response
+    pub async fn stream_prompt(
+        &self,
+        provider: &str,
+        model: &str,
+        prompt: impl Into<Message> + Send,
+    ) -> Result<StreamingCompletionResponse<FinalCompletionResponse>, ClientBuildError> {
+        let client = self.build(provider)?;
+        let completion = client
+            .as_completion()
+            .ok_or(ClientBuildError::UnsupportedFeature(
+                provider.to_string(),
+                "completion".to_string(),
+            ))?;
+
+        let model = completion.completion_model(model);
+        let request = CompletionRequest {
+            preamble: None,
+            tools: vec![],
+            documents: vec![],
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+            tool_choice: None,
+            chat_history: crate::OneOrMany::one(prompt.into()),
+        };
+
+        model
+            .stream(request)
+            .await
+            .map_err(|e| ClientBuildError::FactoryError(e.to_string()))
+    }
+
+    /// Stream a chat with history to the specified provider and model.
+    ///
+    /// # Arguments
+    /// * `provider` - The name of the provider (e.g., "openai", "anthropic")
+    /// * `model` - The name of the model (e.g., "gpt-4o", "claude-3-sonnet")
+    /// * `prompt` - The new prompt to send to the model
+    /// * `chat_history` - The chat history to include with the request
+    ///
+    /// # Returns
+    /// A future that resolves to a streaming completion response
+    pub async fn stream_chat(
+        &self,
+        provider: &str,
+        model: &str,
+        prompt: impl Into<Message> + Send,
+        chat_history: Vec<Message>,
+    ) -> Result<StreamingCompletionResponse<FinalCompletionResponse>, ClientBuildError> {
+        let client = self.build(provider)?;
+        let completion = client
+            .as_completion()
+            .ok_or(ClientBuildError::UnsupportedFeature(
+                provider.to_string(),
+                "completion".to_string(),
+            ))?;
+
+        let model = completion.completion_model(model);
+        let mut history = chat_history;
+        history.push(prompt.into());
+
+        let request = CompletionRequest {
+            preamble: None,
+            tools: vec![],
+            documents: vec![],
+            temperature: None,
+            max_tokens: None,
+            additional_params: None,
+            tool_choice: None,
+            chat_history: crate::OneOrMany::many(history)
+                .unwrap_or_else(|_| crate::OneOrMany::one(Message::user(""))),
+        };
+
+        model
+            .stream(request)
+            .await
+            .map_err(|e| ClientBuildError::FactoryError(e.to_string()))
+    }
+}
+
+/// The final streaming response from a dynamic client.
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct FinalCompletionResponse {
+    pub usage: Option<Usage>,
+}
+
+impl GetTokenUsage for FinalCompletionResponse {
+    fn token_usage(&self) -> Option<Usage> {
+        self.usage
+    }
 }
 
 pub struct ProviderModelId<'builder, 'id> {
@@ -396,6 +529,56 @@ impl<'builder> ProviderModelId<'builder, '_> {
 
     pub fn transcription(self) -> Result<BoxTranscriptionModel<'builder>, ClientBuildError> {
         self.builder.transcription(self.provider, self.model)
+    }
+
+    /// Stream a completion request using this provider and model.
+    ///
+    /// # Arguments
+    /// * `request` - The completion request containing prompt, parameters, etc.
+    ///
+    /// # Returns
+    /// A future that resolves to a streaming completion response
+    pub async fn stream_completion(
+        self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<FinalCompletionResponse>, ClientBuildError> {
+        self.builder
+            .stream_completion(self.provider, self.model, request)
+            .await
+    }
+
+    /// Stream a simple prompt using this provider and model.
+    ///
+    /// # Arguments
+    /// * `prompt` - The prompt to send to the model
+    ///
+    /// # Returns
+    /// A future that resolves to a streaming completion response
+    pub async fn stream_prompt(
+        self,
+        prompt: impl Into<Message> + Send,
+    ) -> Result<StreamingCompletionResponse<FinalCompletionResponse>, ClientBuildError> {
+        self.builder
+            .stream_prompt(self.provider, self.model, prompt)
+            .await
+    }
+
+    /// Stream a chat with history using this provider and model.
+    ///
+    /// # Arguments
+    /// * `prompt` - The new prompt to send to the model
+    /// * `chat_history` - The chat history to include with the request
+    ///
+    /// # Returns
+    /// A future that resolves to a streaming completion response
+    pub async fn stream_chat(
+        self,
+        prompt: impl Into<Message> + Send,
+        chat_history: Vec<Message>,
+    ) -> Result<StreamingCompletionResponse<FinalCompletionResponse>, ClientBuildError> {
+        self.builder
+            .stream_chat(self.provider, self.model, prompt, chat_history)
+            .await
     }
 }
 

@@ -8,37 +8,25 @@
 //!
 //! let deepseek_chat = client.completion_model(deepseek::DEEPSEEK_CHAT);
 //! ```
-//!
-//! # Deepseek Beta
-//! The Deepseek Beta mode can be accessed by simply amending the base URL for your client.
-//!
-//! An example can be found below:
-//! ```rust
-//! let api_key = "deepseek_api_key";
-//!
-//! let client = rig::providers::deepseek::Client::builder(api_key)
-//!     .base_url("https://api.deepseek.com/beta")
-//!     .build();
-//! ```
-//!
-//! Currently, Rig supports the following features for the beta:
-//! - Strict mode tool calling (this is added on automatically by Rig, so you don't need to make any changes yourself)
 
+use async_stream::stream;
+use bytes::Bytes;
 use futures::StreamExt;
+use http::{Method, Request};
 use std::collections::HashMap;
+use tracing::{Instrument, info_span};
 
-use crate::client::{
-    ClientBuilderError, CompletionClient, ProviderClient, VerifyClient, VerifyError,
-};
+use crate::client::{CompletionClient, ProviderClient, VerifyClient, VerifyError};
 use crate::completion::GetTokenUsage;
+use crate::http_client::sse::{Event, GenericEventSource};
+use crate::http_client::{self, HttpClientExt};
 use crate::json_utils::merge;
-use crate::message::Document;
+use crate::message::{Document, DocumentSourceKind};
 use crate::{
     OneOrMany,
     completion::{self, CompletionError, CompletionRequest},
     impl_conversion_traits, json_utils, message,
 };
-use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -49,54 +37,66 @@ use super::openai::StreamingToolCall;
 // ================================================================
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 
-pub struct ClientBuilder<'a> {
+pub struct ClientBuilder<'a, T = reqwest::Client> {
     api_key: &'a str,
     base_url: &'a str,
-    http_client: Option<reqwest::Client>,
+    http_client: T,
 }
 
-impl<'a> ClientBuilder<'a> {
+impl<'a, T> ClientBuilder<'a, T>
+where
+    T: Default,
+{
     pub fn new(api_key: &'a str) -> Self {
         Self {
             api_key,
             base_url: DEEPSEEK_API_BASE_URL,
-            http_client: None,
+            http_client: Default::default(),
         }
     }
+}
 
+impl<'a, T> ClientBuilder<'a, T> {
+    pub fn new_with_client(api_key: &'a str, http_client: T) -> Self {
+        Self {
+            api_key,
+            base_url: DEEPSEEK_API_BASE_URL,
+            http_client,
+        }
+    }
     pub fn base_url(mut self, base_url: &'a str) -> Self {
         self.base_url = base_url;
         self
     }
 
-    pub fn custom_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
-        self
+    pub fn with_client<U>(self, http_client: U) -> ClientBuilder<'a, U> {
+        ClientBuilder {
+            api_key: self.api_key,
+            base_url: self.base_url,
+            http_client,
+        }
     }
 
-    pub fn build(self) -> Result<Client, ClientBuilderError> {
-        let http_client = if let Some(http_client) = self.http_client {
-            http_client
-        } else {
-            reqwest::Client::builder().build()?
-        };
-
-        Ok(Client {
+    pub fn build(self) -> Client<T> {
+        Client {
             base_url: self.base_url.to_string(),
             api_key: self.api_key.to_string(),
-            http_client,
-        })
+            http_client: self.http_client,
+        }
     }
 }
 
 #[derive(Clone)]
-pub struct Client {
+pub struct Client<T = reqwest::Client> {
     pub base_url: String,
     api_key: String,
-    http_client: HttpClient,
+    http_client: T,
 }
 
-impl std::fmt::Debug for Client {
+impl<T> std::fmt::Debug for Client<T>
+where
+    T: std::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("base_url", &self.base_url)
@@ -106,62 +106,79 @@ impl std::fmt::Debug for Client {
     }
 }
 
-impl Client {
-    /// Create a new DeepSeek client builder.
-    ///
-    /// # Example
-    /// ```
-    /// use rig::providers::deepseek::{ClientBuilder, self};
-    ///
-    /// // Initialize the DeepSeek client
-    /// let deepseek = Client::builder("your-deepseek-api-key")
-    ///    .build()
-    /// ```
-    pub fn builder(api_key: &str) -> ClientBuilder<'_> {
-        ClientBuilder::new(api_key)
+impl<T> Client<T>
+where
+    T: HttpClientExt,
+{
+    fn req(
+        &self,
+        method: http_client::Method,
+        path: &str,
+    ) -> http_client::Result<http_client::Builder> {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+
+        http_client::with_bearer_auth(
+            http_client::Request::builder().method(method).uri(url),
+            &self.api_key,
+        )
     }
 
-    /// Create a new DeepSeek client. For more control, use the `builder` method.
-    ///
-    /// # Panics
-    /// - If the reqwest client cannot be built (if the TLS backend cannot be initialized).
-    pub fn new(api_key: &str) -> Self {
-        Self::builder(api_key)
-            .build()
-            .expect("DeepSeek client should build")
+    pub(crate) fn get(&self, path: &str) -> http_client::Result<http_client::Builder> {
+        self.req(http_client::Method::GET, path)
     }
 
-    pub(crate) fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.post(url).bearer_auth(&self.api_key)
-    }
-
-    pub(crate) fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.get(url).bearer_auth(&self.api_key)
+    async fn send<U, R>(
+        &self,
+        req: http_client::Request<U>,
+    ) -> http_client::Result<http_client::Response<http_client::LazyBody<R>>>
+    where
+        U: Into<Bytes> + Send,
+        R: From<Bytes> + Send + 'static,
+    {
+        self.http_client.send(req).await
     }
 }
 
-impl ProviderClient for Client {
+impl Client<reqwest::Client> {
+    pub fn builder(api_key: &str) -> ClientBuilder<'_, reqwest::Client> {
+        ClientBuilder::new(api_key)
+    }
+
+    pub fn new(api_key: &str) -> Self {
+        ClientBuilder::new(api_key).build()
+    }
+
+    pub fn from_env() -> Self {
+        <Self as ProviderClient>::from_env()
+    }
+}
+
+impl<T> ProviderClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
     // If you prefer the environment variable approach:
     fn from_env() -> Self {
         let api_key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY not set");
-        Self::new(&api_key)
+        ClientBuilder::<T>::new(&api_key).build()
     }
 
     fn from_val(input: crate::client::ProviderValue) -> Self {
         let crate::client::ProviderValue::Simple(api_key) = input else {
             panic!("Incorrect provider value type")
         };
-        Self::new(&api_key)
+        ClientBuilder::<T>::new(&api_key).build()
     }
 }
 
-impl CompletionClient for Client {
-    type CompletionModel = CompletionModel;
+impl<T> CompletionClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    type CompletionModel = CompletionModel<T>;
 
     /// Creates a DeepSeek completion model with the given `model_name`.
-    fn completion_model(&self, model_name: &str) -> CompletionModel {
+    fn completion_model(&self, model_name: &str) -> Self::CompletionModel {
         CompletionModel {
             client: self.clone(),
             model: model_name.to_string(),
@@ -169,19 +186,30 @@ impl CompletionClient for Client {
     }
 }
 
-impl VerifyClient for Client {
+impl<T> VerifyClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
     #[cfg_attr(feature = "worker", worker::send)]
     async fn verify(&self) -> Result<(), VerifyError> {
-        let response = self.get("/user/balance").send().await?;
+        let req = self
+            .get("/user/balance")?
+            .body(http_client::NoBody)
+            .map_err(http_client::Error::from)?;
+
+        let response = self.send(req).await?;
+
         match response.status() {
             reqwest::StatusCode::OK => Ok(()),
             reqwest::StatusCode::UNAUTHORIZED => Err(VerifyError::InvalidAuthentication),
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
             | reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-                Err(VerifyError::ProviderError(response.text().await?))
+                let text = http_client::text(response).await?;
+                Err(VerifyError::ProviderError(text))
             }
             _ => {
-                response.error_for_status()?;
+                // TODO: `HttpClientExt` equivalent
+                //response.error_for_status()?;
                 Ok(())
             }
         }
@@ -192,7 +220,7 @@ impl_conversion_traits!(
     AsEmbeddings,
     AsTranscription,
     AsImageGeneration,
-    AsAudioGeneration for Client
+    AsAudioGeneration for Client<T>
 );
 
 #[derive(Debug, Deserialize)]
@@ -222,7 +250,6 @@ pub struct CompletionResponse {
     // you may want other fields
 }
 
-/// Deepseek API token usage metrics
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Usage {
     pub completion_tokens: u32,
@@ -250,23 +277,18 @@ impl Usage {
     }
 }
 
-/// An optional nested field of `Usage` that stores reasoning tokens.
-/// If you aren't using reasoning, this may be None.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct CompletionTokensDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
 }
 
-/// An optional nested field of `Usage` that stores token usage from cache hits.
-/// If there is a cache miss on the Deepseek API, this may be None.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct PromptTokensDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
 }
 
-/// Part of the `Message` type for Deepseek.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Choice {
     pub index: usize,
@@ -275,12 +297,6 @@ pub struct Choice {
     pub finish_reason: String,
 }
 
-/// DeepSeek message types.
-/// Messages on Deepseek are generally split into four types:
-/// - System messages or prompts
-/// - User messages (ie, user prompts)
-/// - Assistant messages (typically responses from the API)
-/// - Tool result messages (should be the latest message in the chain when trying to use function calling from an API)
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
@@ -313,7 +329,6 @@ pub enum Message {
 }
 
 impl Message {
-    /// A system message.
     pub fn system(content: &str) -> Self {
         Message::System {
             content: content.to_owned(),
@@ -381,12 +396,15 @@ impl TryFrom<message::Message> for Vec<Message> {
                             content: text.text,
                             name: None,
                         }),
-                        message::UserContent::Document(Document { data, .. }) => {
-                            Some(Message::User {
-                                content: data,
-                                name: None,
-                            })
-                        }
+                        message::UserContent::Document(Document {
+                            data:
+                                DocumentSourceKind::Base64(content)
+                                | DocumentSourceKind::String(content),
+                            ..
+                        }) => Some(Message::User {
+                            content,
+                            name: None,
+                        }),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -396,6 +414,22 @@ impl TryFrom<message::Message> for Vec<Message> {
             }
             message::Message::Assistant { content, .. } => {
                 let mut messages: Vec<Message> = vec![];
+
+                // extract text
+                let text_content = content
+                    .clone()
+                    .into_iter()
+                    .filter_map(|content| match content {
+                        message::AssistantContent::Text(text) => Some(Message::Assistant {
+                            content: text.text,
+                            name: None,
+                            tool_calls: vec![],
+                        }),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                messages.extend(text_content);
 
                 // extract tool calls
                 let tool_calls = content
@@ -418,28 +452,12 @@ impl TryFrom<message::Message> for Vec<Message> {
                     });
                 }
 
-                // extract text
-                let text_content = content
-                    .into_iter()
-                    .filter_map(|content| match content {
-                        message::AssistantContent::Text(text) => Some(Message::Assistant {
-                            content: text.text,
-                            name: None,
-                            tool_calls: vec![],
-                        }),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-
-                messages.extend(text_content);
-
                 Ok(messages)
             }
         }
     }
 }
 
-/// A tool call with Deepseek.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct ToolCall {
     pub id: String,
@@ -449,7 +467,6 @@ pub struct ToolCall {
     pub function: Function,
 }
 
-/// A function tool call on Deepseek.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Function {
     pub name: String,
@@ -457,7 +474,6 @@ pub struct Function {
     pub arguments: serde_json::Value,
 }
 
-/// The type of a tool call. Generally speaking this can only be `Function` at the moment.
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolType {
@@ -465,69 +481,17 @@ pub enum ToolType {
     Function,
 }
 
-/// A tool definition. Used in request inputs for Deepseek.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolDefinition {
     pub r#type: String,
-    pub function: DeepseekToolDefinition,
+    pub function: completion::ToolDefinition,
 }
 
-/// A Deepseek-specific tool definition.
-/// The difference between this and other tool types is that it includes a `strict` bool field for strict mode tool function calling.
-/// To use this field, you must be using the Beta API (find out more about this in the `crate::providers::deepseek` module).
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct DeepseekToolDefinition {
-    name: String,
-    description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    strict: Option<bool>,
-    parameters: serde_json::Value,
-}
-
-impl DeepseekToolDefinition {
-    fn from_tool(tool: completion::ToolDefinition, beta_mode: &BetaMode) -> Self {
-        let completion::ToolDefinition {
-            name,
-            description,
-            parameters,
-        } = tool;
-        let strict = if matches!(beta_mode, &BetaMode::Enabled) {
-            Some(true)
-        } else {
-            None
-        };
+impl From<crate::completion::ToolDefinition> for ToolDefinition {
+    fn from(tool: crate::completion::ToolDefinition) -> Self {
         Self {
-            name,
-            description,
-            strict,
-            parameters,
-        }
-    }
-}
-
-impl From<DeepseekToolDefinition> for ToolDefinition {
-    fn from(function: DeepseekToolDefinition) -> Self {
-        Self {
-            r#type: "function".to_string(),
-            function,
-        }
-    }
-}
-
-/// Whether beta mode is enabled or not.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum BetaMode {
-    Enabled,
-    Disabled,
-}
-
-impl BetaMode {
-    fn check_from_url(url: &str) -> Self {
-        if url.starts_with("https://api.deepseek.com/beta") {
-            Self::Enabled
-        } else {
-            Self::Disabled
+            r#type: "function".into(),
+            function: tool,
         }
     }
 }
@@ -592,12 +556,12 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
 
 /// The struct implementing the `CompletionModel` trait
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub client: Client<T>,
     pub model: String,
 }
 
-impl CompletionModel {
+impl<T> CompletionModel<T> {
     fn create_completion_request(
         &self,
         completion_request: CompletionRequest,
@@ -627,7 +591,10 @@ impl CompletionModel {
                 .collect::<Vec<_>>(),
         );
 
-        let beta_mode = BetaMode::check_from_url(&self.client.base_url);
+        let tool_choice = completion_request
+            .tool_choice
+            .map(crate::providers::openrouter::ToolChoice::try_from)
+            .transpose()?;
 
         let request = if completion_request.tools.is_empty() {
             json!({
@@ -640,13 +607,8 @@ impl CompletionModel {
                 "model": self.model,
                 "messages": full_history,
                 "temperature": completion_request.temperature,
-                "tools": completion_request
-                            .tools
-                            .iter()
-                            .cloned()
-                            .map(|x| ToolDefinition::from(DeepseekToolDefinition::from_tool(x, &beta_mode)))
-                            .collect::<Vec<_>>(),
-                "tool_choice": "auto",
+                "tools": completion_request.tools.into_iter().map(ToolDefinition::from).collect::<Vec<_>>(),
+                "tool_choice": tool_choice,
             })
         };
 
@@ -660,7 +622,10 @@ impl CompletionModel {
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
+{
     type Response = CompletionResponse;
     type StreamingResponse = StreamingCompletionResponse;
 
@@ -672,28 +637,70 @@ impl completion::CompletionModel for CompletionModel {
         completion::CompletionResponse<CompletionResponse>,
         crate::completion::CompletionError,
     > {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
 
-        tracing::debug!(target: "rig", "DeepSeek completion request: {request:?}");
-
-        let response = self
-            .client
-            .post("/chat/completions")
-            .json(&request)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            let t = response.text().await?;
-            tracing::debug!(target: "rig", "DeepSeek completion: {t}");
-
-            match serde_json::from_str::<ApiResponse<CompletionResponse>>(&t)? {
-                ApiResponse::Ok(response) => response.try_into(),
-                ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
-            }
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "deepseek",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(&request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+            tracing::Span::current()
+        };
+
+        tracing::debug!("DeepSeek completion request: {request:?}");
+
+        let body = serde_json::to_vec(&request)?;
+        let req = self
+            .client
+            .req(Method::POST, "/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+        async move {
+            let response = self.client.http_client.send::<_, Bytes>(req).await?;
+            let status = response.status();
+            let response_body = response.into_body().into_future().await?.to_vec();
+
+            if status.is_success() {
+                match serde_json::from_slice::<ApiResponse<CompletionResponse>>(&response_body)? {
+                    ApiResponse::Ok(response) => {
+                        let span = tracing::Span::current();
+                        span.record(
+                            "gen_ai.output.messages",
+                            serde_json::to_string(&response.choices).unwrap(),
+                        );
+                        span.record("gen_ai.usage.input_tokens", response.usage.prompt_tokens);
+                        span.record(
+                            "gen_ai.usage.output_tokens",
+                            response.usage.completion_tokens,
+                        );
+                        tracing::debug!(target: "rig", "DeepSeek completion output: {}", serde_json::to_string_pretty(&response_body)?);
+
+                        response.try_into()
+                    }
+                    ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
+                }
+            } else {
+                Err(CompletionError::ProviderError(
+                    String::from_utf8_lossy(&response_body).to_string()
+                ))
+            }
         }
+        .instrument(span)
+        .await
     }
 
     #[cfg_attr(feature = "worker", worker::send)]
@@ -704,6 +711,7 @@ impl completion::CompletionModel for CompletionModel {
         crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
         CompletionError,
     > {
+        let preamble = completion_request.preamble.clone();
         let mut request = self.create_completion_request(completion_request)?;
 
         request = merge(
@@ -711,12 +719,42 @@ impl completion::CompletionModel for CompletionModel {
             json!({"stream": true, "stream_options": {"include_usage": true}}),
         );
 
-        let builder = self.client.post("/chat/completions").json(&request);
-        send_compatible_streaming_request(builder).await
+        let body = serde_json::to_vec(&request)?;
+
+        let req = self
+            .client
+            .req(Method::POST, "/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat_streaming",
+                gen_ai.operation.name = "chat_streaming",
+                gen_ai.provider.name = "deepseek",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(&request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
+        tracing::Instrument::instrument(
+            send_compatible_streaming_request(self.client.http_client.clone(), req),
+            span,
+        )
+        .await
     }
 }
 
-/// A streaming chunk from the Deepseek completions streaming API.
 #[derive(Deserialize, Debug)]
 pub struct StreamingDelta {
     #[serde(default)]
@@ -726,7 +764,6 @@ pub struct StreamingDelta {
     reasoning_content: Option<String>,
 }
 
-/// A streaming delta (ie, a part of a text response) from the Deepseek completions streaming API.
 #[derive(Deserialize, Debug)]
 struct StreamingChoice {
     delta: StreamingDelta,
@@ -754,156 +791,161 @@ impl GetTokenUsage for StreamingCompletionResponse {
     }
 }
 
-pub async fn send_compatible_streaming_request(
-    request_builder: reqwest::RequestBuilder,
+pub async fn send_compatible_streaming_request<T>(
+    http_client: T,
+    req: Request<Vec<u8>>,
 ) -> Result<
     crate::streaming::StreamingCompletionResponse<StreamingCompletionResponse>,
     CompletionError,
-> {
-    let response = request_builder.send().await?;
+>
+where
+    T: HttpClientExt + Clone + 'static,
+{
+    let span = tracing::Span::current();
+    let mut event_source = GenericEventSource::new(http_client, req);
 
-    if !response.status().is_success() {
-        return Err(CompletionError::ProviderError(format!(
-            "{}: {}",
-            response.status(),
-            response.text().await?
-        )));
-    }
-
-    // Handle OpenAI Compatible SSE chunks
-    let inner = Box::pin(async_stream::stream! {
-        let mut stream = response.bytes_stream();
-
+    let stream = stream! {
         let mut final_usage = Usage::new();
-        let mut partial_data = None;
+        let mut text_response = String::new();
         let mut calls: HashMap<usize, (String, String, String)> = HashMap::new();
 
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = match chunk_result {
-                Ok(c) => c,
-                Err(e) => {
-                    yield Err(CompletionError::from(e));
-                    break;
+        while let Some(event_result) = event_source.next().await {
+            match event_result {
+                Ok(Event::Open) => {
+                    tracing::trace!("SSE connection opened");
+                    continue;
                 }
-            };
+                Ok(Event::Message(message)) => {
+                    if message.data.trim().is_empty() || message.data == "[DONE]" {
+                        continue;
+                    }
 
-            let text = match String::from_utf8(chunk.to_vec()) {
-                Ok(t) => t,
-                Err(e) => {
-                    yield Err(CompletionError::ResponseError(e.to_string()));
-                    break;
-                }
-            };
-
-
-            for line in text.lines() {
-                let mut line = line.to_string();
-
-                // If there was a remaining part, concat with current line
-                if partial_data.is_some() {
-                    line = format!("{}{}", partial_data.unwrap(), line);
-                    partial_data = None;
-                }
-                // Otherwise full data line
-                else {
-                    let Some(data) = line.strip_prefix("data:") else {
+                    let parsed = serde_json::from_str::<StreamingCompletionChunk>(&message.data);
+                    let Ok(data) = parsed else {
+                        let err = parsed.unwrap_err();
+                        tracing::debug!("Couldn't parse SSE payload as StreamingCompletionChunk: {:?}", err);
                         continue;
                     };
 
-                    let data = data.trim_start();
+                    if let Some(choice) = data.choices.first() {
+                        let delta = &choice.delta;
 
-                    // Partial data, split somewhere in the middle
-                    if !line.ends_with("}") {
-                        partial_data = Some(data.to_string());
-                    } else {
-                        line = data.to_string();
-                    }
-                }
+                        if !delta.tool_calls.is_empty() {
+                            for tool_call in &delta.tool_calls {
+                                let function = &tool_call.function;
 
-                let data = serde_json::from_str::<StreamingCompletionChunk>(&line);
-
-                let Ok(data) = data else {
-                    let err = data.unwrap_err();
-                    tracing::debug!("Couldn't serialize data as StreamingCompletionChunk: {:?}", err);
-                    continue;
-                };
-
-
-                if let Some(choice) = data.choices.first() {
-                    let delta = &choice.delta;
-
-
-                            if !delta.tool_calls.is_empty() {
-                                for tool_call in &delta.tool_calls {
-                                    let function = tool_call.function.clone();
-                                    // Start of tool call
-                                    // name: Some(String)
-                                    // arguments: None
-                                    if function.name.is_some() && function.arguments.is_empty() {
-                                        let id = tool_call.id.clone().unwrap_or("".to_string());
-
-                                        calls.insert(tool_call.index, (id, function.name.clone().unwrap(), "".to_string()));
-                                    }
-                                    // Part of tool call
-                                    // name: None or Empty String
-                                    // arguments: Some(String)
-                                    else if function.name.clone().is_none_or(|s| s.is_empty()) && !function.arguments.is_empty() {
-                                        let Some((id, name, arguments)) = calls.get(&tool_call.index) else {
-                                            tracing::debug!("Partial tool call received but tool call was never started.");
-                                            continue;
-                                        };
-
-                                        let new_arguments = &function.arguments;
-                                        let arguments = format!("{arguments}{new_arguments}");
-
-                                        calls.insert(tool_call.index, (id.clone(), name.clone(), arguments));
-                                    }
-                                    // Entire tool call
-                                    else {
-                                        let id = tool_call.id.clone().unwrap_or("".to_string());
-                                        let name = function.name.expect("function name should be present for complete tool call");
-                                        let arguments = function.arguments;
-                                        let Ok(arguments) = serde_json::from_str(&arguments) else {
-                                            tracing::debug!("Couldn't serialize '{}' as a json value", arguments);
-                                            continue;
-                                        };
-
-                                        yield Ok(crate::streaming::RawStreamingChoice::ToolCall {id, name, arguments, call_id: None })
+                                // Start of tool call
+                                if function.name.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
+                                    && function.arguments.is_empty()
+                                {
+                                    let id = tool_call.id.clone().unwrap_or_default();
+                                    let name = function.name.clone().unwrap();
+                                    calls.insert(tool_call.index, (id, name, String::new()));
+                                }
+                                // Continuation of tool call
+                                else if function.name.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+                                    && !function.arguments.is_empty()
+                                {
+                                    if let Some((id, name, existing_args)) = calls.get(&tool_call.index) {
+                                        let combined = format!("{}{}", existing_args, function.arguments);
+                                        calls.insert(tool_call.index, (id.clone(), name.clone(), combined));
+                                    } else {
+                                        tracing::debug!("Partial tool call received but tool call was never started.");
                                     }
                                 }
-                            }
+                                // Complete tool call
+                                else {
+                                    let id = tool_call.id.clone().unwrap_or_default();
+                                    let name = function.name.clone().unwrap_or_default();
+                                    let arguments_str = function.arguments.clone();
 
-                            if let Some(content) = &delta.reasoning_content {
-                                yield Ok(crate::streaming::RawStreamingChoice::Reasoning { reasoning: content.to_string(), id: None})
-                            }
+                                    let Ok(arguments_json) = serde_json::from_str::<serde_json::Value>(&arguments_str) else {
+                                        tracing::debug!("Couldn't parse tool call args '{}'", arguments_str);
+                                        continue;
+                                    };
 
-                            if let Some(content) = &delta.content {
-                                yield Ok(crate::streaming::RawStreamingChoice::Message(content.clone()))
+                                    yield Ok(crate::streaming::RawStreamingChoice::ToolCall {
+                                        id,
+                                        name,
+                                        arguments: arguments_json,
+                                        call_id: None,
+                                    });
+                                }
                             }
+                        }
 
+                        // DeepSeek-specific reasoning stream
+                        if let Some(content) = &delta.reasoning_content {
+                            yield Ok(crate::streaming::RawStreamingChoice::Reasoning {
+                                reasoning: content.to_string(),
+                                id: None,
+                                signature: None,
+                            });
+                        }
+
+                        if let Some(content) = &delta.content {
+                            text_response += content;
+                            yield Ok(crate::streaming::RawStreamingChoice::Message(content.clone()));
+                        }
+                    }
+
+                    if let Some(usage) = data.usage {
+                        final_usage = usage.clone();
+                    }
                 }
-
-
-                if let Some(usage) = data.usage {
-                    final_usage = usage.clone();
+                Err(crate::http_client::Error::StreamEnded) => {
+                    break;
+                }
+                Err(err) => {
+                    tracing::error!(?err, "SSE error");
+                    yield Err(CompletionError::ResponseError(err.to_string()));
+                    break;
                 }
             }
         }
 
-        for (_, (id, name, arguments)) in calls {
-            let Ok(arguments) = serde_json::from_str(&arguments) else {
+        event_source.close();
+
+        let mut tool_calls = Vec::new();
+        // Flush accumulated tool calls
+        for (index, (id, name, arguments)) in calls {
+            let Ok(arguments_json) = serde_json::from_str::<serde_json::Value>(&arguments) else {
                 continue;
             };
 
-            yield Ok(crate::streaming::RawStreamingChoice::ToolCall {id, name, arguments, call_id: None });
+            tool_calls.push(ToolCall {
+                id: id.clone(),
+                index,
+                r#type: ToolType::Function,
+                function: Function {
+                    name: name.clone(),
+                    arguments: arguments_json.clone()
+                }
+            });
+            yield Ok(crate::streaming::RawStreamingChoice::ToolCall {
+                id,
+                name,
+                arguments: arguments_json,
+                call_id: None,
+            });
         }
 
-        yield Ok(crate::streaming::RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-            usage: final_usage.clone()
-        }))
-    });
+        let message = Message::Assistant {
+            content: text_response,
+            name: None,
+            tool_calls
+        };
 
-    Ok(crate::streaming::StreamingCompletionResponse::stream(inner))
+        span.record("gen_ai.output.messages", serde_json::to_string(&message).unwrap());
+
+        yield Ok(crate::streaming::RawStreamingChoice::FinalResponse(
+            StreamingCompletionResponse { usage: final_usage.clone() }
+        ));
+    };
+
+    Ok(crate::streaming::StreamingCompletionResponse::stream(
+        Box::pin(stream),
+    ))
 }
 
 // ================================================================

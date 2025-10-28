@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/0xPlaygrounds/rig/compare/rig-bedrock-v0.3.4...rig-bedrock-v0.3.5) - 2025-10-28
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.3.4](https://github.com/0xPlaygrounds/rig/compare/rig-bedrock-v0.3.3...rig-bedrock-v0.3.4) - 2025-10-27
+
+### Added
+
+- *(bedrock)* Support streaming thinking ([#946](https://github.com/0xPlaygrounds/rig/pull/946))
+- *(bedrock)* Implement usage ([#934](https://github.com/0xPlaygrounds/rig/pull/934))
+
+### Other
+
+- Fix bedrock tool calls with zero arguments ([#989](https://github.com/0xPlaygrounds/rig/pull/989))
+- Dependent packages no longer force unnecessary features on rig-core ([#964](https://github.com/0xPlaygrounds/rig/pull/964))
+
+## [0.3.3](https://github.com/0xPlaygrounds/rig/compare/rig-bedrock-v0.3.2...rig-bedrock-v0.3.3) - 2025-10-14
+
+### Added
+
+- *(rig-973)* DocumentSourceKind::String ([#882](https://github.com/0xPlaygrounds/rig/pull/882))
+
+### Other
+
+- provider SDK has issue with DocumentBlock ([#892](https://github.com/0xPlaygrounds/rig/pull/892))
+
+## [0.3.2](https://github.com/0xPlaygrounds/rig/compare/rig-bedrock-v0.3.1...rig-bedrock-v0.3.2) - 2025-09-29
+
+### Added
+
+- *(rig-795)* support file URLs for audio, video, documents ([#823](https://github.com/0xPlaygrounds/rig/pull/823))
+
+### Other
+
+- *(rig-963)* fix feature regression in AWS bedrock ([#863](https://github.com/0xPlaygrounds/rig/pull/863))
+
+## [0.3.1](https://github.com/0xPlaygrounds/rig/compare/rig-bedrock-v0.3.0...rig-bedrock-v0.3.1) - 2025-09-15
+
+### Added
+
+- *(rig-931)* support file input for images on Gemini ([#790](https://github.com/0xPlaygrounds/rig/pull/790))
+
+## [0.3.0](https://github.com/0xPlaygrounds/rig/compare/rig-bedrock-v0.2.9...rig-bedrock-v0.3.0) - 2025-09-02
+
+### Added
+
+- VerifyClient trait ([#724](https://github.com/0xPlaygrounds/rig/pull/724))
+
+### Other
+
+- added AWS Bedrock client creation using from_env ([#710](https://github.com/0xPlaygrounds/rig/pull/710))
+
 ## [0.2.9](https://github.com/0xPlaygrounds/rig/compare/rig-bedrock-v0.2.8...rig-bedrock-v0.2.9) - 2025-08-20
 
 ### Other

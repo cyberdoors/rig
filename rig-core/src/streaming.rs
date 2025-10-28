@@ -11,15 +11,16 @@
 use crate::OneOrMany;
 use crate::agent::Agent;
 use crate::agent::prompt_request::streaming::StreamingPromptRequest;
+use crate::client::builder::FinalCompletionResponse;
 use crate::completion::{
     CompletionError, CompletionModel, CompletionRequestBuilder, CompletionResponse, GetTokenUsage,
     Message, Usage,
 };
 use crate::message::{AssistantContent, Reasoning, Text, ToolCall, ToolFunction};
+use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use futures::stream::{AbortHandle, Abortable};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::boxed::Box;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
@@ -69,17 +70,20 @@ where
     /// A text chunk from a message response
     Message(String),
 
-    /// A tool call response chunk
+    /// A tool call response (in its entirety)
     ToolCall {
         id: String,
         call_id: Option<String>,
         name: String,
         arguments: serde_json::Value,
     },
+    /// A tool call partial/delta
+    ToolCallDelta { id: String, delta: String },
     /// A reasoning chunk
     Reasoning {
         id: Option<String>,
         reasoning: String,
+        signature: Option<String>,
     },
 
     /// The final response object, must be yielded if you want the
@@ -214,16 +218,27 @@ where
                 RawStreamingChoice::Message(text) => {
                     // Forward the streaming tokens to the outer stream
                     // and concat the text together
-                    stream.text = format!("{}{}", stream.text, text.clone());
+                    stream.text = format!("{}{}", stream.text, text);
                     Poll::Ready(Some(Ok(StreamedAssistantContent::text(&text))))
                 }
-                RawStreamingChoice::Reasoning { id, reasoning } => {
+                RawStreamingChoice::ToolCallDelta { id, delta } => {
+                    Poll::Ready(Some(Ok(StreamedAssistantContent::ToolCallDelta {
+                        id,
+                        delta,
+                    })))
+                }
+                RawStreamingChoice::Reasoning {
+                    id,
+                    reasoning,
+                    signature,
+                } => {
                     // Forward the streaming tokens to the outer stream
                     // and concat the text together
-                    stream.reasoning = format!("{}{}", stream.reasoning, reasoning.clone());
+                    stream.reasoning = format!("{}{}", stream.reasoning, reasoning);
                     Poll::Ready(Some(Ok(StreamedAssistantContent::Reasoning(Reasoning {
                         id,
-                        reasoning: vec![stream.reasoning.clone()],
+                        reasoning: vec![reasoning],
+                        signature,
                     }))))
                 }
                 RawStreamingChoice::ToolCall {
@@ -277,24 +292,27 @@ where
 pub trait StreamingPrompt<M, R>
 where
     M: CompletionModel + 'static,
-    <M as CompletionModel>::StreamingResponse: Send,
+    <M as CompletionModel>::StreamingResponse: WasmCompatSend,
     R: Clone + Unpin + GetTokenUsage,
 {
     /// Stream a simple prompt to the model
-    fn stream_prompt(&self, prompt: impl Into<Message> + Send) -> StreamingPromptRequest<M, ()>;
+    fn stream_prompt(
+        &self,
+        prompt: impl Into<Message> + WasmCompatSend,
+    ) -> StreamingPromptRequest<M, ()>;
 }
 
 /// Trait for high-level streaming chat interface
-pub trait StreamingChat<M, R>: Send + Sync
+pub trait StreamingChat<M, R>: WasmCompatSend + WasmCompatSync
 where
     M: CompletionModel + 'static,
-    <M as CompletionModel>::StreamingResponse: Send,
+    <M as CompletionModel>::StreamingResponse: WasmCompatSend,
     R: Clone + Unpin + GetTokenUsage,
 {
     /// Stream a chat with history to the model
     fn stream_chat(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
         chat_history: Vec<Message>,
     ) -> StreamingPromptRequest<M, ()>;
 }
@@ -304,17 +322,17 @@ pub trait StreamingCompletion<M: CompletionModel> {
     /// Generate a streaming completion from a request
     fn stream_completion(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
         chat_history: Vec<Message>,
     ) -> impl Future<Output = Result<CompletionRequestBuilder<M>, CompletionError>>;
 }
 
-pub(crate) struct StreamingResultDyn<R: Clone + Unpin> {
+pub(crate) struct StreamingResultDyn<R: Clone + Unpin + GetTokenUsage> {
     pub(crate) inner: StreamingResult<R>,
 }
 
-impl<R: Clone + Unpin> Stream for StreamingResultDyn<R> {
-    type Item = Result<RawStreamingChoice<()>, CompletionError>;
+impl<R: Clone + Unpin + GetTokenUsage> Stream for StreamingResultDyn<R> {
+    type Item = Result<RawStreamingChoice<FinalCompletionResponse>, CompletionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let stream = self.get_mut();
@@ -324,15 +342,26 @@ impl<R: Clone + Unpin> Stream for StreamingResultDyn<R> {
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
             Poll::Ready(Some(Ok(chunk))) => match chunk {
-                RawStreamingChoice::FinalResponse(_) => {
-                    Poll::Ready(Some(Ok(RawStreamingChoice::FinalResponse(()))))
-                }
+                RawStreamingChoice::FinalResponse(res) => Poll::Ready(Some(Ok(
+                    RawStreamingChoice::FinalResponse(FinalCompletionResponse {
+                        usage: res.token_usage(),
+                    }),
+                ))),
                 RawStreamingChoice::Message(m) => {
                     Poll::Ready(Some(Ok(RawStreamingChoice::Message(m))))
                 }
-                RawStreamingChoice::Reasoning { id, reasoning } => {
-                    Poll::Ready(Some(Ok(RawStreamingChoice::Reasoning { id, reasoning })))
+                RawStreamingChoice::ToolCallDelta { id, delta } => {
+                    Poll::Ready(Some(Ok(RawStreamingChoice::ToolCallDelta { id, delta })))
                 }
+                RawStreamingChoice::Reasoning {
+                    id,
+                    reasoning,
+                    signature,
+                } => Poll::Ready(Some(Ok(RawStreamingChoice::Reasoning {
+                    id,
+                    reasoning,
+                    signature,
+                }))),
                 RawStreamingChoice::ToolCall {
                     id,
                     name,
@@ -349,9 +378,10 @@ impl<R: Clone + Unpin> Stream for StreamingResultDyn<R> {
     }
 }
 
-/// helper function to stream a completion request to stdout
+/// A helper function to stream a completion request to stdout.
+/// Tool call deltas are ignored as tool calls are generally much easier to handle when received in their entirety rather than using deltas.
 pub async fn stream_to_stdout<M>(
-    agent: &Agent<M>,
+    agent: &'static Agent<M>,
     stream: &mut StreamingCompletionResponse<M::StreamingResponse>,
 ) -> Result<(), std::io::Error>
 where
@@ -371,13 +401,13 @@ where
             }
             Ok(StreamedAssistantContent::ToolCall(tool_call)) => {
                 let res = agent
-                    .tools
-                    .call(
+                    .tool_server_handle
+                    .call_tool(
                         &tool_call.function.name,
-                        tool_call.function.arguments.to_string(),
+                        &tool_call.function.arguments.to_string(),
                     )
                     .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    .map_err(|x| std::io::Error::other(x.to_string()))?;
                 println!("\nResult: {res}");
             }
             Ok(StreamedAssistantContent::Final(res)) => {
@@ -404,6 +434,7 @@ where
                 eprintln!("Error: {e}");
                 break;
             }
+            _ => {}
         }
     }
 
@@ -471,6 +502,10 @@ mod tests {
                     println!("\nTool Call: {tc:?}");
                     chunk_count += 1;
                 }
+                Ok(StreamedAssistantContent::ToolCallDelta { delta, .. }) => {
+                    println!("\nTool Call delta: {delta:?}");
+                    chunk_count += 1;
+                }
                 Ok(StreamedAssistantContent::Final(res)) => {
                     println!("\nFinal response: {res:?}");
                 }
@@ -520,6 +555,7 @@ mod tests {
 pub enum StreamedAssistantContent<R> {
     Text(Text),
     ToolCall(ToolCall),
+    ToolCallDelta { id: String, delta: String },
     Reasoning(Reasoning),
     Final(R),
 }

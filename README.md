@@ -17,7 +17,7 @@
 <br>
 <a href=""><img src="https://img.shields.io/badge/built_with-Rust-dca282.svg?logo=rust" /></a>
 &nbsp;
-<a href="https://twitter.com/Playgrounds0x"><img src="https://img.shields.io/twitter/follow/Playgrounds0x"></a> &nbsp
+<a href="https://twitter.com/ryzomeai"><img src="https://img.shields.io/twitter/follow/ryzomeai"></a> &nbsp
 
 <br>
 </p>
@@ -48,7 +48,7 @@
 - [High-level features](#high-level-features)
 - [Who's using Rig in production?](#who-is-using-rig-in-production)
 - [Get Started](#get-started)
-  - [Simple example:](#simple-example)
+  - [Simple example](#simple-example)
 - [Integrations](#integrations)
 
 ## What is Rig?
@@ -56,19 +56,23 @@ Rig is a Rust library for building scalable, modular, and ergonomic **LLM-powere
 
 More information about this crate can be found in the [official](https://docs.rig.rs) & [crate](https://docs.rs/rig-core/latest/rig/) (API Reference) documentations.
 
-## High-level features
+## Features
+- Agentic workflows that can handle multi-turn streaming and prompting
+- Full [GenAI Semantic Convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/) compatibility
+- 20+ model providers, all under one singular unified interface
+- 10+ vector store integrations, all under one singular unified interface
 - Full support for LLM completion and embedding workflows
-- Simple but powerful common abstractions over LLM providers (e.g. OpenAI, Cohere) and vector stores (e.g. MongoDB, SQlite, in-memory)
+- Support for transcription, audio generation and image generation model capabilities
 - Integrate LLMs in your app with minimal boilerplate
+- Full WASM compatibility (core library only)
 
 ## Who is using Rig in production?
 Below is a non-exhaustive list of companies and people who are using Rig in production:
-- [Dria Compute Node](https://github.com/firstbatchxyz/dkn-compute-node) - a node that serves computation results within the Dria Knowledge Network
-- [The MCP Rust SDK](https://github.com/modelcontextprotocol/rust-sdk ) - the official Model Context Protocol Rust SDK. Has an example for usage with Rig.
-- [Probe](https://github.com/buger/probe) - an AI-friendly, fully local semantic code search tool.
-- [NINE](https://github.com/NethermindEth/nine) - Neural Interconnected Nodes Engine, by [Nethermind.](https://www.nethermind.io/)
-- [rig-onchain-kit](https://github.com/0xPlaygrounds/rig-onchain-kit) - the Rig Onchain Kit. Intended to make interactions between Solana/EVM and Rig much easier to implement.
-- [Linera Protocol](https://github.com/linera-io/linera-protocol) - Decentralized blockchain infrastructure designed for highly scalable, secure, low-latency Web3 applications.
+- [St Jude](https://www.stjude.org/) - Using Rig for a chatbot utility as part of [`proteinpaint`](https://github.com/stjude/proteinpaint), a genomics visualisation tool.
+- [Coral Protocol](https://www.coralprotocol.org/) - Using Rig extensively, both internally as well as part of the [Coral Rust SDK.](https://github.com/Coral-Protocol/coral-rs)
+- [VT Code](https://github.com/vinhnx/vtcode) - VT Code is a Rust-based terminal coding agent with semantic code intelligence via Tree-sitter and ast-grep. VT Code uses `rig` for simplifying LLM calls and implement model picker.
+- [Dria](https://dria.co/) - a decentralised AI network. Currently using Rig as part of their [compute node.](https://github.com/firstbatchxyz/dkn-compute-node)
+- [Nethermind](https://www.nethermind.io/) - Using Rig as part of their [Neural Interconnected Nodes Engine](https://github.com/NethermindEth/nine) framework.
 - [Listen](https://github.com/piotrostr/listen) - A framework aiming to become the go-to framework for AI portfolio management agents. Powers [the Listen app.](https://app.listen-rs.com/)
 
 Are you also using Rig in production? [Open an issue](https://www.github.com/0xPlaygrounds/rig/issues) to have your name added!
@@ -116,10 +120,15 @@ Vector stores are available as separate companion-crates:
 - Milvus: [`rig-milvus`](https://github.com/0xPlaygrounds/rig/tree/main/rig-milvus)
 - ScyllaDB: [`rig-scylladb`](https://github.com/0xPlaygrounds/rig/tree/main/rig-scylladb)
 - AWS S3Vectors: [`rig-s3vectors`](https://github.com/0xPlaygrounds/rig/tree/main/rig-s3vectors)
+- HelixDB: [`rig-helixdb`](https://github.com/0xPlaygrounds/rig/tree/main/rig-helixdb)
 
 The following providers are available as separate companion-crates:
+- AWS Bedrock: [`rig-bedrock`](https://github.com/0xPlaygrounds/rig/tree/main/rig-bedrock)
 - Fastembed: [`rig-fastembed`](https://github.com/0xPlaygrounds/rig/tree/main/rig-fastembed)
 - Eternal AI: [`rig-eternalai`](https://github.com/0xPlaygrounds/rig/tree/main/rig-eternalai)
+
+We also have some other associated crates that have additional functionality you may find helpful when using Rig:
+- `rig-onchain-kit` - the [Rig Onchain Kit.](https://github.com/0xPlaygrounds/rig-onchain-kit) Intended to make interactions between Solana/EVM and Rig much easier to implement.
 
 
 <p align="center">

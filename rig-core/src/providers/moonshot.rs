@@ -8,9 +8,8 @@
 //!
 //! let moonshot_model = client.completion_model(moonshot::MOONSHOT_CHAT);
 //! ```
-use crate::client::{
-    ClientBuilderError, CompletionClient, ProviderClient, VerifyClient, VerifyError,
-};
+use crate::client::{CompletionClient, ProviderClient, VerifyClient, VerifyError};
+use crate::http_client::HttpClientExt;
 use crate::json_utils::merge;
 use crate::providers::openai::send_compatible_streaming_request;
 use crate::streaming::StreamingCompletionResponse;
@@ -19,27 +18,42 @@ use crate::{
     json_utils,
     providers::openai,
 };
-use crate::{impl_conversion_traits, message};
-use serde::Deserialize;
+use crate::{http_client, impl_conversion_traits, message};
+use http::Method;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::{Instrument, info_span};
 
 // ================================================================
 // Main Moonshot Client
 // ================================================================
 const MOONSHOT_API_BASE_URL: &str = "https://api.moonshot.cn/v1";
 
-pub struct ClientBuilder<'a> {
+pub struct ClientBuilder<'a, T = reqwest::Client> {
     api_key: &'a str,
     base_url: &'a str,
-    http_client: Option<reqwest::Client>,
+    http_client: T,
 }
 
-impl<'a> ClientBuilder<'a> {
+impl<'a, T> ClientBuilder<'a, T>
+where
+    T: Default,
+{
     pub fn new(api_key: &'a str) -> Self {
         Self {
             api_key,
             base_url: MOONSHOT_API_BASE_URL,
-            http_client: None,
+            http_client: Default::default(),
+        }
+    }
+}
+
+impl<'a, T> ClientBuilder<'a, T> {
+    pub fn new_with_client(api_key: &'a str, http_client: T) -> Self {
+        Self {
+            api_key,
+            base_url: MOONSHOT_API_BASE_URL,
+            http_client,
         }
     }
 
@@ -48,34 +62,34 @@ impl<'a> ClientBuilder<'a> {
         self
     }
 
-    pub fn custom_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
-        self
+    pub fn with_client<U>(self, http_client: U) -> ClientBuilder<'a, U> {
+        ClientBuilder {
+            api_key: self.api_key,
+            base_url: self.base_url,
+            http_client,
+        }
     }
 
-    pub fn build(self) -> Result<Client, ClientBuilderError> {
-        let http_client = if let Some(http_client) = self.http_client {
-            http_client
-        } else {
-            reqwest::Client::builder().build()?
-        };
-
-        Ok(Client {
+    pub fn build(self) -> Client<T> {
+        Client {
             base_url: self.base_url.to_string(),
             api_key: self.api_key.to_string(),
-            http_client,
-        })
+            http_client: self.http_client,
+        }
     }
 }
 
 #[derive(Clone)]
-pub struct Client {
+pub struct Client<T = reqwest::Client> {
     base_url: String,
     api_key: String,
-    http_client: reqwest::Client,
+    http_client: T,
 }
 
-impl std::fmt::Debug for Client {
+impl<T> std::fmt::Debug for Client<T>
+where
+    T: std::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("base_url", &self.base_url)
@@ -85,60 +99,66 @@ impl std::fmt::Debug for Client {
     }
 }
 
-impl Client {
-    /// Create a new Moonshot client builder.
-    ///
-    /// # Example
-    /// ```
-    /// use rig::providers::moonshot::{ClientBuilder, self};
-    ///
-    /// // Initialize the Moonshot client
-    /// let moonshot = Client::builder("your-moonshot-api-key")
-    ///    .build()
-    /// ```
-    pub fn builder(api_key: &str) -> ClientBuilder<'_> {
-        ClientBuilder::new(api_key)
+impl<T> Client<T>
+where
+    T: HttpClientExt,
+{
+    fn req(
+        &self,
+        method: http_client::Method,
+        path: &str,
+    ) -> http_client::Result<http_client::Builder> {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+
+        http_client::with_bearer_auth(
+            http_client::Builder::new().method(method).uri(url),
+            &self.api_key,
+        )
     }
 
-    /// Create a new Moonshot client. For more control, use the `builder` method.
-    ///
-    /// # Panics
-    /// - If the reqwest client cannot be built (if the TLS backend cannot be initialized).
-    pub fn new(api_key: &str) -> Self {
-        Self::builder(api_key)
-            .build()
-            .expect("Moonshot client should build")
-    }
-
-    pub(crate) fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.post(url).bearer_auth(&self.api_key)
-    }
-
-    pub(crate) fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.get(url).bearer_auth(&self.api_key)
+    pub(crate) fn get(&self, path: &str) -> http_client::Result<http_client::Builder> {
+        self.req(http_client::Method::GET, path)
     }
 }
 
-impl ProviderClient for Client {
+impl Client<reqwest::Client> {
+    pub fn builder(api_key: &str) -> ClientBuilder<'_, reqwest::Client> {
+        ClientBuilder::new(api_key)
+    }
+
+    pub fn new(api_key: &str) -> Self {
+        Self::builder(api_key).build()
+    }
+
+    pub fn from_env() -> Self {
+        <Self as ProviderClient>::from_env()
+    }
+}
+
+impl<T> ProviderClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
     /// Create a new Moonshot client from the `MOONSHOT_API_KEY` environment variable.
     /// Panics if the environment variable is not set.
     fn from_env() -> Self {
         let api_key = std::env::var("MOONSHOT_API_KEY").expect("MOONSHOT_API_KEY not set");
-        Self::new(&api_key)
+        ClientBuilder::<T>::new(&api_key).build()
     }
 
     fn from_val(input: crate::client::ProviderValue) -> Self {
         let crate::client::ProviderValue::Simple(api_key) = input else {
             panic!("Incorrect provider value type")
         };
-        Self::new(&api_key)
+        ClientBuilder::<T>::new(&api_key).build()
     }
 }
 
-impl CompletionClient for Client {
-    type CompletionModel = CompletionModel;
+impl<T> CompletionClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    type CompletionModel = CompletionModel<T>;
 
     /// Create a completion model with the given name.
     ///
@@ -151,25 +171,34 @@ impl CompletionClient for Client {
     ///
     /// let completion_model = moonshot.completion_model(moonshot::MOONSHOT_CHAT);
     /// ```
-    fn completion_model(&self, model: &str) -> CompletionModel {
+    fn completion_model(&self, model: &str) -> Self::CompletionModel {
         CompletionModel::new(self.clone(), model)
     }
 }
 
-impl VerifyClient for Client {
+impl<T> VerifyClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
     #[cfg_attr(feature = "worker", worker::send)]
     async fn verify(&self) -> Result<(), VerifyError> {
-        let response = self.get("/models").send().await?;
+        let req = self
+            .get("/models")?
+            .body(http_client::NoBody)
+            .map_err(http_client::Error::from)?;
+
+        let response = HttpClientExt::send(&self.http_client, req).await?;
+
         match response.status() {
             reqwest::StatusCode::OK => Ok(()),
             reqwest::StatusCode::UNAUTHORIZED => Err(VerifyError::InvalidAuthentication),
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR => {
-                Err(VerifyError::ProviderError(response.text().await?))
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::BAD_GATEWAY => {
+                let text = http_client::text(response).await?;
+                Err(VerifyError::ProviderError(text))
             }
-            _ => {
-                response.error_for_status()?;
-                Ok(())
-            }
+            _ => Ok(()),
         }
     }
 }
@@ -178,7 +207,7 @@ impl_conversion_traits!(
     AsEmbeddings,
     AsTranscription,
     AsImageGeneration,
-    AsAudioGeneration for Client
+    AsAudioGeneration for Client<T>
 );
 
 #[derive(Debug, Deserialize)]
@@ -204,13 +233,13 @@ enum ApiResponse<T> {
 pub const MOONSHOT_CHAT: &str = "moonshot-v1-128k";
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    client: Client<T>,
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T> {
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -246,19 +275,26 @@ impl CompletionModel {
                 .collect::<Vec<_>>(),
         );
 
+        let tool_choice = completion_request
+            .tool_choice
+            .map(ToolChoice::try_from)
+            .transpose()?;
+
         let request = if completion_request.tools.is_empty() {
             json!({
                 "model": self.model,
                 "messages": full_history,
                 "temperature": completion_request.temperature,
+                "max_tokens": completion_request.max_tokens,
             })
         } else {
             json!({
                 "model": self.model,
                 "messages": full_history,
                 "temperature": completion_request.temperature,
+                "max_tokens": completion_request.max_tokens,
                 "tools": completion_request.tools.into_iter().map(openai::ToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
             })
         };
 
@@ -272,7 +308,10 @@ impl CompletionModel {
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
+{
     type Response = openai::CompletionResponse;
     type StreamingResponse = openai::StreamingCompletionResponse;
 
@@ -281,32 +320,79 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<openai::CompletionResponse>, CompletionError> {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
 
-        let response = self
-            .client
-            .post("/chat/completions")
-            .json(&request)
-            .send()
-            .await?;
+        println!(
+            "Moonshot API input: {request}",
+            request = serde_json::to_string_pretty(&request).unwrap()
+        );
 
-        if response.status().is_success() {
-            let t = response.text().await?;
-            tracing::debug!(target: "rig", "MoonShot completion error: {}", t);
-
-            match serde_json::from_str::<ApiResponse<openai::CompletionResponse>>(&t)? {
-                ApiResponse::Ok(response) => {
-                    tracing::info!(target: "rig",
-                        "MoonShot completion token usage: {:?}",
-                        response.usage.clone().map(|usage| format!("{usage}")).unwrap_or("N/A".to_string())
-                    );
-                    response.try_into()
-                }
-                ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.error.message)),
-            }
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "moonshot",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(&request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
-        }
+            tracing::Span::current()
+        };
+
+        let body = serde_json::to_vec(&request)?;
+        let req = self
+            .client
+            .req(Method::POST, "/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(http_client::Error::from)?;
+
+        let async_block = async move {
+            let response = self.client.http_client.send::<_, bytes::Bytes>(req).await?;
+
+            let status = response.status();
+            let response_body = response.into_body().into_future().await?.to_vec();
+
+            if status.is_success() {
+                match serde_json::from_slice::<ApiResponse<openai::CompletionResponse>>(
+                    &response_body,
+                )? {
+                    ApiResponse::Ok(response) => {
+                        tracing::debug!(target: "rig::completions", "MoonShot completion response: {t}", t = serde_json::to_string_pretty(&response)?);
+                        let span = tracing::Span::current();
+                        span.record("gen_ai.response.id", response.id.clone());
+                        span.record("gen_ai.response.model_name", response.model.clone());
+                        span.record(
+                            "gen_ai.output.messages",
+                            serde_json::to_string(&response.choices).unwrap(),
+                        );
+                        if let Some(ref usage) = response.usage {
+                            span.record("gen_ai.usage.input_tokens", usage.prompt_tokens);
+                            span.record(
+                                "gen_ai.usage.output_tokens",
+                                usage.total_tokens - usage.prompt_tokens,
+                            );
+                        }
+                        response.try_into()
+                    }
+                    ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.error.message)),
+                }
+            } else {
+                Err(CompletionError::ProviderError(
+                    String::from_utf8_lossy(&response_body).to_string(),
+                ))
+            }
+        };
+
+        async_block.instrument(span).await
     }
 
     #[cfg_attr(feature = "worker", worker::send)]
@@ -314,15 +400,68 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        let preamble = request.preamble.clone();
         let mut request = self.create_completion_request(request)?;
+
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat_streaming",
+                gen_ai.operation.name = "chat_streaming",
+                gen_ai.provider.name = "moonshot",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(&request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
 
         request = merge(
             request,
             json!({"stream": true, "stream_options": {"include_usage": true}}),
         );
 
-        let builder = self.client.post("/chat/completions").json(&request);
+        let body = serde_json::to_vec(&request)?;
+        let req = self
+            .client
+            .req(Method::POST, "/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(http_client::Error::from)?;
 
-        send_compatible_streaming_request(builder).await
+        send_compatible_streaming_request(self.client.http_client.clone(), req)
+            .instrument(span)
+            .await
+    }
+}
+
+#[derive(Default, Debug, Deserialize, Serialize)]
+pub enum ToolChoice {
+    None,
+    #[default]
+    Auto,
+}
+
+impl TryFrom<message::ToolChoice> for ToolChoice {
+    type Error = CompletionError;
+
+    fn try_from(value: message::ToolChoice) -> Result<Self, Self::Error> {
+        let res = match value {
+            message::ToolChoice::None => Self::None,
+            message::ToolChoice::Auto => Self::Auto,
+            choice => {
+                return Err(CompletionError::ProviderError(format!(
+                    "Unsupported tool choice type: {choice:?}"
+                )));
+            }
+        };
+
+        Ok(res)
     }
 }

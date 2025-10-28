@@ -1,14 +1,16 @@
+use http::Request;
 use std::collections::HashMap;
+use tracing::info_span;
 
 use crate::{
     completion::GetTokenUsage,
+    http_client::{self, HttpClientExt},
     json_utils,
     message::{ToolCall, ToolFunction},
     streaming::{self},
 };
 use async_stream::stream;
 use futures::StreamExt;
-use reqwest::RequestBuilder;
 use serde_json::{Value, json};
 
 use crate::completion::{CompletionError, CompletionRequest};
@@ -111,38 +113,76 @@ pub struct FinalCompletionResponse {
     pub usage: ResponseUsage,
 }
 
-impl super::CompletionModel {
+impl<T> super::CompletionModel<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + 'static,
+{
     pub(crate) async fn stream(
         &self,
         completion_request: CompletionRequest,
     ) -> Result<streaming::StreamingCompletionResponse<FinalCompletionResponse>, CompletionError>
     {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
 
         let request = json_utils::merge(request, json!({"stream": true}));
 
-        let builder = self.client.post("/chat/completions").json(&request);
+        let body = serde_json::to_vec(&request)?;
 
-        send_streaming_request(builder).await
+        let req = self
+            .client
+            .post("/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|x| CompletionError::HttpError(x.into()))?;
+
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat_streaming",
+                gen_ai.operation.name = "chat_streaming",
+                gen_ai.provider.name = "openrouter",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
+        tracing::Instrument::instrument(
+            send_streaming_request(self.client.http_client.clone(), req),
+            span,
+        )
+        .await
     }
 }
 
-pub async fn send_streaming_request(
-    request_builder: RequestBuilder,
-) -> Result<streaming::StreamingCompletionResponse<FinalCompletionResponse>, CompletionError> {
-    let response = request_builder.send().await?;
+pub async fn send_streaming_request<T>(
+    client: T,
+    req: Request<Vec<u8>>,
+) -> Result<streaming::StreamingCompletionResponse<FinalCompletionResponse>, CompletionError>
+where
+    T: HttpClientExt + Clone + 'static,
+{
+    let response = client.send_streaming(req).await?;
+    let status = response.status();
 
-    if !response.status().is_success() {
+    if !status.is_success() {
         return Err(CompletionError::ProviderError(format!(
-            "{}: {}",
-            response.status(),
-            response.text().await?
+            "Got response error trying to send a completion request to OpenRouter: {status}"
         )));
     }
 
+    let mut stream = response.into_body();
+
     // Handle OpenAI Compatible SSE chunks
-    let stream = Box::pin(stream! {
-        let mut stream = response.bytes_stream();
+    let stream = stream! {
         let mut tool_calls = HashMap::new();
         let mut partial_line = String::new();
         let mut final_usage = None;
@@ -151,7 +191,7 @@ pub async fn send_streaming_request(
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
-                    yield Err(CompletionError::from(e));
+                    yield Err(CompletionError::from(http_client::Error::Instance(e.into())));
                     break;
                 }
             };
@@ -318,7 +358,9 @@ pub async fn send_streaming_request(
             usage: final_usage.unwrap_or_default()
         }))
 
-    });
+    };
 
-    Ok(streaming::StreamingCompletionResponse::stream(stream))
+    Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
+        stream,
+    )))
 }

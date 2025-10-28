@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.15](https://github.com/0xPlaygrounds/rig/compare/rig-fastembed-v0.2.14...rig-fastembed-v0.2.15) - 2025-10-28
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.14](https://github.com/0xPlaygrounds/rig/compare/rig-fastembed-v0.2.13...rig-fastembed-v0.2.14) - 2025-10-27
+
+### Other
+
+- Dependent packages no longer force unnecessary features on rig-core ([#964](https://github.com/0xPlaygrounds/rig/pull/964))
+
+## [0.2.13](https://github.com/0xPlaygrounds/rig/compare/rig-fastembed-v0.2.12...rig-fastembed-v0.2.13) - 2025-10-14
+
+### Other
+
+- *(rig-984)* rename rig fastembed example filenames ([#914](https://github.com/0xPlaygrounds/rig/pull/914))
+
+## [0.2.12](https://github.com/0xPlaygrounds/rig/compare/rig-fastembed-v0.2.11...rig-fastembed-v0.2.12) - 2025-09-29
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.11](https://github.com/0xPlaygrounds/rig/compare/rig-fastembed-v0.2.10...rig-fastembed-v0.2.11) - 2025-09-15
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.10](https://github.com/0xPlaygrounds/rig/compare/rig-fastembed-v0.2.9...rig-fastembed-v0.2.10) - 2025-09-02
+
+### Other
+
+- updated the following local packages: rig-core
+
 ## [0.2.9](https://github.com/0xPlaygrounds/rig/compare/rig-fastembed-v0.2.8...rig-fastembed-v0.2.9) - 2025-08-20
 
 ### Other

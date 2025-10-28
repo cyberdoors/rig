@@ -1,10 +1,13 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use tracing::{Instrument, info_span};
 
 use super::client::{ApiErrorResponse, ApiResponse, Client, Usage};
 
 use crate::{
     OneOrMany,
     completion::{self, CompletionError, CompletionRequest},
+    http_client::HttpClientExt,
     json_utils,
     providers::openai::Message,
 };
@@ -13,6 +16,7 @@ use serde_json::{Value, json};
 use crate::providers::openai::AssistantContent;
 use crate::providers::openrouter::streaming::FinalCompletionResponse;
 use crate::streaming::StreamingCompletionResponse;
+use crate::telemetry::SpanCombinator;
 
 // ================================================================
 // OpenRouter Completion API
@@ -121,15 +125,52 @@ pub struct Choice {
     pub finish_reason: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged, rename_all = "snake_case")]
+pub enum ToolChoice {
+    None,
+    Auto,
+    Required,
+    Function(Vec<ToolChoiceFunctionKind>),
+}
+
+impl TryFrom<crate::message::ToolChoice> for ToolChoice {
+    type Error = CompletionError;
+
+    fn try_from(value: crate::message::ToolChoice) -> Result<Self, Self::Error> {
+        let res = match value {
+            crate::message::ToolChoice::None => Self::None,
+            crate::message::ToolChoice::Auto => Self::Auto,
+            crate::message::ToolChoice::Required => Self::Required,
+            crate::message::ToolChoice::Specific { function_names } => {
+                let vec: Vec<ToolChoiceFunctionKind> = function_names
+                    .into_iter()
+                    .map(|name| ToolChoiceFunctionKind::Function { name })
+                    .collect();
+
+                Self::Function(vec)
+            }
+        };
+
+        Ok(res)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "function")]
+pub enum ToolChoiceFunctionKind {
+    Function { name: String },
+}
+
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub(crate) client: Client<T>,
     /// Name of the model (e.g.: deepseek-ai/DeepSeek-R1)
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T> {
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -165,12 +206,30 @@ impl CompletionModel {
         // Combine all messages into a single history
         full_history.extend(chat_history);
 
-        let request = json!({
+        let tool_choice = completion_request
+            .tool_choice
+            .map(ToolChoice::try_from)
+            .transpose()?;
+
+        let mut request = json!({
             "model": self.model,
             "messages": full_history,
-            "temperature": completion_request.temperature,
-            "tools": completion_request.tools.into_iter().map(crate::providers::openai::completion::ToolDefinition::from).collect::<Vec<_>>()
         });
+
+        if let Some(temperature) = completion_request.temperature {
+            request["temperature"] = json!(temperature);
+        }
+
+        if !completion_request.tools.is_empty() {
+            request["tools"] = json!(
+                completion_request
+                    .tools
+                    .into_iter()
+                    .map(crate::providers::openai::completion::ToolDefinition::from)
+                    .collect::<Vec<_>>()
+            );
+            request["tool_choice"] = json!(tool_choice);
+        }
 
         let request = if let Some(params) = completion_request.additional_params {
             json_utils::merge(request, params)
@@ -182,7 +241,10 @@ impl CompletionModel {
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + 'static,
+{
     type Response = CompletionResponse;
     type StreamingResponse = FinalCompletionResponse;
 
@@ -191,31 +253,64 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
-
-        let response = self
-            .client
-            .post("/chat/completions")
-            .json(&request)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            match response.json::<ApiResponse<CompletionResponse>>().await? {
-                ApiResponse::Ok(response) => {
-                    tracing::info!(target: "rig",
-                        "OpenRouter completion token usage: {:?}",
-                        response.usage.clone().map(|usage| format!("{usage}")).unwrap_or("N/A".to_string())
-                    );
-                    tracing::debug!(target: "rig",
-                        "OpenRouter response: {response:?}");
-                    response.try_into()
-                }
-                ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
-            }
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completion",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "openrouter",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+            tracing::Span::current()
+        };
+
+        let body = serde_json::to_vec(&request)?;
+
+        let req = self
+            .client
+            .post("/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|x| CompletionError::HttpError(x.into()))?;
+
+        async move {
+            let response = self.client.http_client.send::<_, Bytes>(req).await?;
+            let status = response.status();
+            let response_body = response.into_body().into_future().await?.to_vec();
+
+            if status.is_success() {
+                match serde_json::from_slice::<ApiResponse<CompletionResponse>>(&response_body)? {
+                    ApiResponse::Ok(response) => {
+                        let span = tracing::Span::current();
+                        span.record_token_usage(&response.usage);
+                        span.record_model_output(&response.choices);
+                        span.record("gen_ai.response.id", &response.id);
+                        span.record("gen_ai.response.model_name", &response.model);
+
+                        tracing::debug!(target: "rig::completion",
+                            "OpenRouter response: {response:?}");
+                        response.try_into()
+                    }
+                    ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
+                }
+            } else {
+                Err(CompletionError::ProviderError(
+                    String::from_utf8_lossy(&response_body).to_string(),
+                ))
+            }
         }
+        .instrument(span)
+        .await
     }
 
     #[cfg_attr(feature = "worker", worker::send)]

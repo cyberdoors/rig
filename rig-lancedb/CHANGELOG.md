@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.26](https://github.com/0xPlaygrounds/rig/compare/rig-lancedb-v0.2.25...rig-lancedb-v0.2.26) - 2025-10-28
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.25](https://github.com/0xPlaygrounds/rig/compare/rig-lancedb-v0.2.24...rig-lancedb-v0.2.25) - 2025-10-27
+
+### Added
+
+- *(rig-976)* support filters for `VectorSearchRequest` ([#952](https://github.com/0xPlaygrounds/rig/pull/952))
+- *(rig-996)* generic streaming ([#955](https://github.com/0xPlaygrounds/rig/pull/955))
+
+### Fixed
+
+- *(rig-1006)* text-embedding-ada-002 doesn't support custom dimensions ([#967](https://github.com/0xPlaygrounds/rig/pull/967))
+
+## [0.2.24](https://github.com/0xPlaygrounds/rig/compare/rig-lancedb-v0.2.23...rig-lancedb-v0.2.24) - 2025-10-14
+
+### Added
+
+- *(rig-990)* allow configuring optional lancedb features ([#923](https://github.com/0xPlaygrounds/rig/pull/923))
+- *(rig-951)* generic HTTP client ([#875](https://github.com/0xPlaygrounds/rig/pull/875))
+
+### Fixed
+
+- trying to fix test regressions part 2 ([#913](https://github.com/0xPlaygrounds/rig/pull/913))
+- test regression ([#912](https://github.com/0xPlaygrounds/rig/pull/912))
+
+## [0.2.23](https://github.com/0xPlaygrounds/rig/compare/rig-lancedb-v0.2.22...rig-lancedb-v0.2.23) - 2025-09-29
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.22](https://github.com/0xPlaygrounds/rig/compare/rig-lancedb-v0.2.21...rig-lancedb-v0.2.22) - 2025-09-15
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.21](https://github.com/0xPlaygrounds/rig/compare/rig-lancedb-v0.2.20...rig-lancedb-v0.2.21) - 2025-09-02
+
+### Other
+
+- *(rig-907)* use where clause for trait bounds ([#749](https://github.com/0xPlaygrounds/rig/pull/749))
+
 ## [0.2.20](https://github.com/0xPlaygrounds/rig/compare/rig-lancedb-v0.2.19...rig-lancedb-v0.2.20) - 2025-08-20
 
 ### Other

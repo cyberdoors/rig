@@ -7,6 +7,164 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.23.0...rig-core-v0.23.1) - 2025-10-28
+
+### Fixed
+
+- compliance with OpenAI API  stream error "message":"Model field is required." ([#1006](https://github.com/0xPlaygrounds/rig/pull/1006))
+
+## [0.23.0](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.22.0...rig-core-v0.23.0) - 2025-10-27
+
+### Added
+
+- *(rig-1021)* allow language to be set to None for transcription ([#997](https://github.com/0xPlaygrounds/rig/pull/997))
+- *(rig-1008)* add Send + Sync to ProviderClient ([#974](https://github.com/0xPlaygrounds/rig/pull/974))
+- *(rig-976)* support filters for `VectorSearchRequest` ([#952](https://github.com/0xPlaygrounds/rig/pull/952))
+- *(rig-1004)* expose tool call partials ([#960](https://github.com/0xPlaygrounds/rig/pull/960))
+- convert video media mime type ([#959](https://github.com/0xPlaygrounds/rig/pull/959))
+- *(rig-996)* generic streaming ([#955](https://github.com/0xPlaygrounds/rig/pull/955))
+- *(gemini)* Support streaming thinking ([#947](https://github.com/0xPlaygrounds/rig/pull/947))
+- *(ollama)* thinking ([#948](https://github.com/0xPlaygrounds/rig/pull/948))
+- *(anthropic)* Expose the reasoning signature ([#945](https://github.com/0xPlaygrounds/rig/pull/945))
+
+### Fixed
+
+- CompletionError: ProviderError: {"error":{"code":null,"param":null,"message":"[] is too short - 'tools'","type":"invalid_request_error"}} ([#1003](https://github.com/0xPlaygrounds/rig/pull/1003))
+- *(rig-1023)* reasoning/thinking stream sends redundant data ([#1002](https://github.com/0xPlaygrounds/rig/pull/1002))
+- *(rig-1022)* GenericEventSource polling None should not error ([#999](https://github.com/0xPlaygrounds/rig/pull/999))
+- *(huggingface)* align tool message serialization with OpenAI API spec ([#993](https://github.com/0xPlaygrounds/rig/pull/993))
+- *(rig-1020)* add `futures-timer/wasm-bindgen` feature for wasm ([#995](https://github.com/0xPlaygrounds/rig/pull/995))
+- *(rig-1019)* fix potentially incorrect provider URLs ([#991](https://github.com/0xPlaygrounds/rig/pull/991))
+- *(rig-1016)* Huggingface completions API 404 ([#986](https://github.com/0xPlaygrounds/rig/pull/986))
+- *(rig-1011)* docs mismatch ([#981](https://github.com/0xPlaygrounds/rig/pull/981))
+- *(rig-1007)* tool servers broken in WASM ([#970](https://github.com/0xPlaygrounds/rig/pull/970))
+- *(rig-1009)* Incorrect struct shape (OpenAI) ([#973](https://github.com/0xPlaygrounds/rig/pull/973))
+- *(rig-997)* allow string documents for OpenAI Completions API ([#966](https://github.com/0xPlaygrounds/rig/pull/966))
+- *(rig-1006)* text-embedding-ada-002 doesn't support custom dimensions ([#967](https://github.com/0xPlaygrounds/rig/pull/967))
+- *(agent)* Apply tool_choice to completion request ([#958](https://github.com/0xPlaygrounds/rig/pull/958))
+- *(rig-1005)* enable toggling "think" on ollama ([#962](https://github.com/0xPlaygrounds/rig/pull/962))
+- *(openrouter)* use reqwest_post helper to construct full URL ([#943](https://github.com/0xPlaygrounds/rig/pull/943))
+- *(rig-995)* include max tokens in Moonshot API request ([#935](https://github.com/0xPlaygrounds/rig/pull/935))
+
+### Other
+
+- InvalidCodeWithMessage error enum variant ([#963](https://github.com/0xPlaygrounds/rig/pull/963))
+- *(rig-1003)* update list of production rig users ([#956](https://github.com/0xPlaygrounds/rig/pull/956))
+- make streaming prompt module pub ([#944](https://github.com/0xPlaygrounds/rig/pull/944))
+- *(rig-993)* re-import all items from embeddings module in rig::embeddings ([#936](https://github.com/0xPlaygrounds/rig/pull/936))
+
+## [0.22.0](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.21.0...rig-core-v0.22.0) - 2025-10-14
+
+### Added
+
+- *(rig-937)* evals ([#905](https://github.com/0xPlaygrounds/rig/pull/905))
+- *(rig-986)* tool servers ([#916](https://github.com/0xPlaygrounds/rig/pull/916))
+- *(rig-988)* cancel streaming prompts from prompt hook ([#918](https://github.com/0xPlaygrounds/rig/pull/918))
+- *(rig-990)* allow configuring optional lancedb features ([#923](https://github.com/0xPlaygrounds/rig/pull/923))
+- return usage when streaming completions from a dynamic client ([#903](https://github.com/0xPlaygrounds/rig/pull/903))
+- *(rig-979)* discord bot integration ([#900](https://github.com/0xPlaygrounds/rig/pull/900))
+- *(rig-935)* support cancelling multi-turn prompt loop from hook ([#904](https://github.com/0xPlaygrounds/rig/pull/904))
+- *(rig-951)* generic HTTP client ([#875](https://github.com/0xPlaygrounds/rig/pull/875))
+- *(rig-977)* add description field to Agent, update tool impl ([#895](https://github.com/0xPlaygrounds/rig/pull/895))
+- *(rig-848)* extract JSON with chat history ([#888](https://github.com/0xPlaygrounds/rig/pull/888))
+- *(rig-955)* set up tool choice capability for Extractor ([#884](https://github.com/0xPlaygrounds/rig/pull/884))
+- *(rig-964)* add tool choice to agent ([#883](https://github.com/0xPlaygrounds/rig/pull/883))
+- *(rig-973)* DocumentSourceKind::String ([#882](https://github.com/0xPlaygrounds/rig/pull/882))
+
+### Fixed
+
+- *(rig-991)* nested struct conversion to Gemini OpenAPI type schema ([#926](https://github.com/0xPlaygrounds/rig/pull/926))
+- *(rig-982)* embedding_model_with_ndims() doesn't pass dimensions parameter to OpenAI API
+- *(rig-983)* http request fail due to no content type header set ([#909](https://github.com/0xPlaygrounds/rig/pull/909))
+- Correct data structure for OpenAI responses images and PDFs ([#880](https://github.com/0xPlaygrounds/rig/pull/880))
+
+### Other
+
+- *(rig-975)* split streaming portion of PromptHook ([#889](https://github.com/0xPlaygrounds/rig/pull/889))
+- *(rig-975)* split streaming portion of PromptHook
+- *(rig-959)* Documents in Huggingface are not converted properly ([#874](https://github.com/0xPlaygrounds/rig/pull/874))
+
+## [0.21.0](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.20.0...rig-core-v0.21.0) - 2025-09-29
+
+### Added
+
+- GenAI SemConv support (otel) ([#850](https://github.com/0xPlaygrounds/rig/pull/850))
+- add streaming support to DynClientBuilder ([#824](https://github.com/0xPlaygrounds/rig/pull/824))
+- *(rig-912)* rework `Chat` trait for multi-turn ([#846](https://github.com/0xPlaygrounds/rig/pull/846))
+- *(rig-795)* support file URLs for audio, video, documents ([#823](https://github.com/0xPlaygrounds/rig/pull/823))
+- *(rig-943)* support thinking for cohere ([#827](https://github.com/0xPlaygrounds/rig/pull/827))
+
+### Fixed
+
+- only youtube videos should accept null mime type (gemini) ([#873](https://github.com/0xPlaygrounds/rig/pull/873))
+- *(rig-970)* file URLs should be able to accept empty media type (Gemini) ([#872](https://github.com/0xPlaygrounds/rig/pull/872))
+- *(rig-970)* youtube video ingestion doesn't work (gemini)
+- fix(rig-962)(deepseek): tool calls not recognised when put behind text content ([#862](https://github.com/0xPlaygrounds/rig/pull/862))
+- fix-853 ([#854](https://github.com/0xPlaygrounds/rig/pull/854))
+- *(rig-956)* DocumentSourceKind fails to serialize with common serializers ([#849](https://github.com/0xPlaygrounds/rig/pull/849))
+- *(rig-957)* huggingface should convert image URLs ([#848](https://github.com/0xPlaygrounds/rig/pull/848))
+- *(rig-950)* openai imagegen doesn't work with gpt-image-1 ([#837](https://github.com/0xPlaygrounds/rig/pull/837))
+- ci lints ([#832](https://github.com/0xPlaygrounds/rig/pull/832))
+
+### Other
+
+- *(rig-969)* update features on README ([#870](https://github.com/0xPlaygrounds/rig/pull/870))
+- *(rig-963)* fix feature regression in AWS bedrock ([#863](https://github.com/0xPlaygrounds/rig/pull/863))
+- fix typo in comment ([#866](https://github.com/0xPlaygrounds/rig/pull/866))
+- parse NDJSON correctly, fixes #825 ([#826](https://github.com/0xPlaygrounds/rig/pull/826))
+- make Reasoning non-exhaustive ([#830](https://github.com/0xPlaygrounds/rig/pull/830))
+
+## [0.20.0](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.19.0...rig-core-v0.20.0) - 2025-09-15
+
+### Added
+
+- think tool, vector store tool, better agent tool ([#424](https://github.com/0xPlaygrounds/rig/pull/424))
+- *(rig-926)* make agent multi stream prompting more granular ([#796](https://github.com/0xPlaygrounds/rig/pull/796))
+- *(rig-928)* allow openai chat completions to be used as an extractor ([#797](https://github.com/0xPlaygrounds/rig/pull/797))
+- *(rig-831)* ensure all features are added to docs.rs ([#801](https://github.com/0xPlaygrounds/rig/pull/801))
+- *(rig-931)* support file input for images on Gemini ([#790](https://github.com/0xPlaygrounds/rig/pull/790))
+
+### Fixed
+
+- *(rig-939)* incomplete byte sequence error when streaming from OpenAI Responses ([#812](https://github.com/0xPlaygrounds/rig/pull/812))
+- *(rig-933)* openai responses api integration does not properly take images ([#799](https://github.com/0xPlaygrounds/rig/pull/799))
+
+### Other
+
+- *(cohere)* use `reqwest-eventsource`, some code cleanup ([#815](https://github.com/0xPlaygrounds/rig/pull/815))
+- *(openAI, openrouter, deepseek, groq)* use `reqwest-eventsource` ([#814](https://github.com/0xPlaygrounds/rig/pull/814))
+- remove unnecessary clone ([#808](https://github.com/0xPlaygrounds/rig/pull/808))
+- *(rig-924)* update rmcp to 0.6 ([#785](https://github.com/0xPlaygrounds/rig/pull/785))
+- optional candidates token count ([#793](https://github.com/0xPlaygrounds/rig/pull/793))
+- allow prompt without preamble ([#791](https://github.com/0xPlaygrounds/rig/pull/791))
+
+## [0.19.0](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.18.2...rig-core-v0.19.0) - 2025-09-02
+
+### Added
+
+- *(rig-core)* add fn cli_chatbot() back ([#769](https://github.com/0xPlaygrounds/rig/pull/769))
+- *(rig-918)* expose more token usage metadata metrics for gemini ([#768](https://github.com/0xPlaygrounds/rig/pull/768))
+- *(rig-911)* ConvertMessage trait ([#753](https://github.com/0xPlaygrounds/rig/pull/753))
+- *(openai responses)* add `minimal` variant to ReasoningEffort ([#765](https://github.com/0xPlaygrounds/rig/pull/765))
+- *(rig-904)* Rework CLI chatbot integration ([#756](https://github.com/0xPlaygrounds/rig/pull/756))
+- Pauseable streams ([#733](https://github.com/0xPlaygrounds/rig/pull/733))
+- *(rig-910)* function calls fail when using OpenAI Responses API with reasoning models ([#754](https://github.com/0xPlaygrounds/rig/pull/754))
+- *(rig-901)* Make multi-turn stream return a `Send + 'static` stream ([#739](https://github.com/0xPlaygrounds/rig/pull/739))
+- VerifyClient trait ([#724](https://github.com/0xPlaygrounds/rig/pull/724))
+- *(rig-898)* make MultiTurnStreamItem pub ([#735](https://github.com/0xPlaygrounds/rig/pull/735))
+
+### Fixed
+
+- *(rig-core examples)* add `required` field to calculator example tool definitions ([#757](https://github.com/0xPlaygrounds/rig/pull/757))
+- *(openai responses)* recursively add additionalProperties: false to nested schemas ([#755](https://github.com/0xPlaygrounds/rig/pull/755))
+- empty type in Vec<T> schema conversion for Gemini API ([#721](https://github.com/0xPlaygrounds/rig/pull/721)) ([#748](https://github.com/0xPlaygrounds/rig/pull/748))
+
+### Other
+- 修改文档错误 ([#771](https://github.com/0xPlaygrounds/rig/pull/771))
+- *(rig-907)* use where clause for trait bounds ([#749](https://github.com/0xPlaygrounds/rig/pull/749))
+- *(rig-913)* add feature gated items to docs ([#764](https://github.com/0xPlaygrounds/rig/pull/764))
+- Remove duplicate methods in perplexity ([#725](https://github.com/0xPlaygrounds/rig/pull/725))
+
 ## [0.18.2](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.18.1...rig-core-v0.18.2) - 2025-08-20
 
 ### Fixed

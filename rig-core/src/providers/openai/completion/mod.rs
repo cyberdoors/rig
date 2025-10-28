@@ -3,14 +3,18 @@
 // ================================================================
 
 use super::{ApiErrorResponse, ApiResponse, Client, streaming::StreamingCompletionResponse};
-use crate::completion::{CompletionError, CompletionRequest};
-use crate::message::{AudioMediaType, ImageDetail};
+use crate::completion::{
+    CompletionError, CompletionRequest as CoreCompletionRequest, GetTokenUsage,
+};
+use crate::http_client::{self, HttpClientExt};
+use crate::message::{AudioMediaType, DocumentSourceKind, ImageDetail, MimeType};
 use crate::one_or_many::string_or_one_or_many;
+use crate::telemetry::{ProviderResponseExt, SpanCombinator};
 use crate::{OneOrMany, completion, json_utils, message};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::fmt;
+use tracing::{Instrument, info_span};
 
 use std::str::FromStr;
 
@@ -270,6 +274,33 @@ impl From<completion::ToolDefinition> for ToolDefinition {
     }
 }
 
+#[derive(Default, Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    None,
+    Required,
+}
+
+impl TryFrom<crate::message::ToolChoice> for ToolChoice {
+    type Error = CompletionError;
+    fn try_from(value: crate::message::ToolChoice) -> Result<Self, Self::Error> {
+        let res = match value {
+            message::ToolChoice::Specific { .. } => {
+                return Err(CompletionError::ProviderError(
+                    "Provider doesn't support only using specific tools".to_string(),
+                ));
+            }
+            message::ToolChoice::Auto => Self::Auto,
+            message::ToolChoice::None => Self::None,
+            message::ToolChoice::Required => Self::Required,
+        };
+
+        Ok(res)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Function {
     pub name: String,
@@ -312,31 +343,74 @@ impl TryFrom<message::Message> for Vec<Message> {
                         })
                         .collect::<Result<Vec<_>, _>>()
                 } else {
-                    let other_content = OneOrMany::many(other_content).expect(
-                        "There must be other content here if there were no tool result content",
-                    );
-
-                    Ok(vec![Message::User {
-                        content: other_content.map(|content| match content {
+                    let other_content: Vec<UserContent> = other_content
+                        .into_iter()
+                        .map(|content| match content {
                             message::UserContent::Text(message::Text { text }) => {
-                                UserContent::Text { text }
+                                Ok(UserContent::Text { text })
                             }
                             message::UserContent::Image(message::Image {
-                                data, detail, ..
-                            }) => UserContent::Image {
-                                image_url: ImageUrl {
-                                    url: data,
-                                    detail: detail.unwrap_or_default(),
-                                },
-                            },
-                            message::UserContent::Document(message::Document { data, .. }) => {
-                                UserContent::Text { text: data }
-                            }
-                            message::UserContent::Audio(message::Audio {
                                 data,
+                                detail,
                                 media_type,
                                 ..
-                            }) => UserContent::Audio {
+                            }) => match data {
+                                DocumentSourceKind::Url(url) => Ok(UserContent::Image {
+                                    image_url: ImageUrl {
+                                        url,
+                                        detail: detail.unwrap_or_default(),
+                                    },
+                                }),
+                                DocumentSourceKind::Base64(data) => {
+                                    let url = format!(
+                                        "data:{};base64,{}",
+                                        media_type.map(|i| i.to_mime_type()).ok_or(
+                                            message::MessageError::ConversionError(
+                                                "OpenAI Image URI must have media type".into()
+                                            )
+                                        )?,
+                                        data
+                                    );
+
+                                    let detail =
+                                        detail.ok_or(message::MessageError::ConversionError(
+                                            "OpenAI image URI must have image detail".into(),
+                                        ))?;
+
+                                    Ok(UserContent::Image {
+                                        image_url: ImageUrl { url, detail },
+                                    })
+                                }
+                                DocumentSourceKind::Raw(_) => {
+                                    Err(message::MessageError::ConversionError(
+                                        "Raw files not supported, encode as base64 first".into(),
+                                    ))
+                                }
+                                DocumentSourceKind::Unknown => {
+                                    Err(message::MessageError::ConversionError(
+                                        "Document has no body".into(),
+                                    ))
+                                }
+                                doc => Err(message::MessageError::ConversionError(format!(
+                                    "Unsupported document type: {doc:?}"
+                                ))),
+                            },
+                            message::UserContent::Document(message::Document { data, .. }) => {
+                                if let DocumentSourceKind::Base64(text)
+                                | DocumentSourceKind::String(text) = data
+                                {
+                                    Ok(UserContent::Text { text })
+                                } else {
+                                    Err(message::MessageError::ConversionError(
+                                        "Documents must be base64 or a string".into(),
+                                    ))
+                                }
+                            }
+                            message::UserContent::Audio(message::Audio {
+                                data: DocumentSourceKind::Base64(data),
+                                media_type,
+                                ..
+                            }) => Ok(UserContent::Audio {
                                 input_audio: InputAudio {
                                     data,
                                     format: match media_type {
@@ -344,9 +418,19 @@ impl TryFrom<message::Message> for Vec<Message> {
                                         None => AudioMediaType::MP3,
                                     },
                                 },
-                            },
-                            _ => unreachable!(),
-                        }),
+                            }),
+                            _ => Err(message::MessageError::ConversionError(
+                                "Tool result is in unsupported format".into(),
+                            )),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    let other_content = OneOrMany::many(other_content).expect(
+                        "There must be other content here if there were no tool result content",
+                    );
+
+                    Ok(vec![Message::User {
+                        content: other_content,
                         name: None,
                     }])
                 }
@@ -481,17 +565,12 @@ impl From<UserContent> for message::UserContent {
     fn from(content: UserContent) -> Self {
         match content {
             UserContent::Text { text } => message::UserContent::text(text),
-            UserContent::Image { image_url } => message::UserContent::image(
-                image_url.url,
-                Some(message::ContentFormat::default()),
-                None,
-                Some(image_url.detail),
-            ),
-            UserContent::Audio { input_audio } => message::UserContent::audio(
-                input_audio.data,
-                Some(message::ContentFormat::default()),
-                Some(input_audio.format),
-            ),
+            UserContent::Image { image_url } => {
+                message::UserContent::image_url(image_url.url, None, Some(image_url.detail))
+            }
+            UserContent::Audio { input_audio } => {
+                message::UserContent::audio(input_audio.data, Some(input_audio.format))
+            }
         }
     }
 }
@@ -630,7 +709,40 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl ProviderResponseExt for CompletionResponse {
+    type OutputMessage = Choice;
+    type Usage = Usage;
+
+    fn get_response_id(&self) -> Option<String> {
+        Some(self.id.to_owned())
+    }
+
+    fn get_response_model_name(&self) -> Option<String> {
+        Some(self.model.to_owned())
+    }
+
+    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
+        self.choices.clone()
+    }
+
+    fn get_text_response(&self) -> Option<String> {
+        let Message::User { ref content, .. } = self.choices.last()?.message.clone() else {
+            return None;
+        };
+
+        let UserContent::Text { text } = content.first() else {
+            return None;
+        };
+
+        Some(text)
+    }
+
+    fn get_usage(&self) -> Option<Self::Usage> {
+        self.usage.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Choice {
     pub index: usize,
     pub message: Message,
@@ -642,6 +754,21 @@ pub struct Choice {
 pub struct Usage {
     pub prompt_tokens: usize,
     pub total_tokens: usize,
+}
+
+impl Usage {
+    pub fn new() -> Self {
+        Self {
+            prompt_tokens: 0,
+            total_tokens: 0,
+        }
+    }
+}
+
+impl Default for Usage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl fmt::Display for Usage {
@@ -657,40 +784,72 @@ impl fmt::Display for Usage {
     }
 }
 
+impl GetTokenUsage for Usage {
+    fn token_usage(&self) -> Option<crate::completion::Usage> {
+        let mut usage = crate::completion::Usage::new();
+        usage.input_tokens = self.prompt_tokens as u64;
+        usage.output_tokens = (self.total_tokens - self.prompt_tokens) as u64;
+        usage.total_tokens = self.total_tokens as u64;
+
+        Some(usage)
+    }
+}
+
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub(crate) client: Client<T>,
     /// Name of the model (e.g.: gpt-3.5-turbo-1106)
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T>
+where
+    T: HttpClientExt + Default + std::fmt::Debug + Clone + 'static,
+{
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
         }
     }
+}
 
-    pub fn into_agent_builder(self) -> crate::agent::AgentBuilder<Self> {
-        crate::agent::AgentBuilder::new(self)
-    }
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CompletionRequest {
+    model: String,
+    messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(flatten)]
+    additional_params: Option<serde_json::Value>,
+}
 
-    pub(crate) fn create_completion_request(
-        &self,
-        completion_request: CompletionRequest,
-    ) -> Result<Value, CompletionError> {
-        // Build up the order of messages (context, chat_history)
+impl TryFrom<(String, CoreCompletionRequest)> for CompletionRequest {
+    type Error = CompletionError;
+
+    fn try_from((model, req): (String, CoreCompletionRequest)) -> Result<Self, Self::Error> {
         let mut partial_history = vec![];
-        if let Some(docs) = completion_request.normalized_documents() {
+        if let Some(docs) = req.normalized_documents() {
             partial_history.push(docs);
         }
-        partial_history.extend(completion_request.chat_history);
+        let CoreCompletionRequest {
+            preamble,
+            chat_history,
+            tools,
+            temperature,
+            additional_params,
+            tool_choice,
+            ..
+        } = req;
 
-        // Initialize full history with preamble (or empty if non-existent)
-        let mut full_history: Vec<Message> = completion_request
-            .preamble
-            .map_or_else(Vec::new, |preamble| vec![Message::system(&preamble)]);
+        partial_history.extend(chat_history);
+
+        let mut full_history: Vec<Message> =
+            preamble.map_or_else(Vec::new, |preamble| vec![Message::system(&preamble)]);
 
         // Convert and extend the rest of the history
         full_history.extend(
@@ -703,90 +862,139 @@ impl CompletionModel {
                 .collect::<Vec<_>>(),
         );
 
-        let request = if completion_request.tools.is_empty() {
-            serde_json::json!({
-                "model": self.model,
-                "messages": full_history,
+        let tool_choice = tool_choice.map(ToolChoice::try_from).transpose()?;
 
-            })
-        } else {
-            json!({
-                "model": self.model,
-                "messages": full_history,
-                "tools": completion_request.tools.into_iter().map(ToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
-            })
+        let res = Self {
+            model,
+            messages: full_history,
+            tools: tools
+                .into_iter()
+                .map(ToolDefinition::from)
+                .collect::<Vec<_>>(),
+            tool_choice,
+            temperature,
+            additional_params,
         };
 
-        // only include temperature if it exists
-        // because some models don't support temperature
-        let request = if let Some(temperature) = completion_request.temperature {
-            json_utils::merge(
-                request,
-                json!({
-                    "temperature": temperature,
-                }),
-            )
-        } else {
-            request
-        };
-
-        let request = if let Some(params) = completion_request.additional_params {
-            json_utils::merge(request, params)
-        } else {
-            request
-        };
-
-        Ok(request)
+        Ok(res)
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl crate::telemetry::ProviderRequestExt for CompletionRequest {
+    type InputMessage = Message;
+
+    fn get_input_messages(&self) -> Vec<Self::InputMessage> {
+        self.messages.clone()
+    }
+
+    fn get_system_prompt(&self) -> Option<String> {
+        let first_message = self.messages.first()?;
+
+        let Message::System { ref content, .. } = first_message.clone() else {
+            return None;
+        };
+
+        let SystemContent { text, .. } = content.first();
+
+        Some(text)
+    }
+
+    fn get_prompt(&self) -> Option<String> {
+        let last_message = self.messages.last()?;
+
+        let Message::User { ref content, .. } = last_message.clone() else {
+            return None;
+        };
+
+        let UserContent::Text { text } = content.first() else {
+            return None;
+        };
+
+        Some(text)
+    }
+
+    fn get_model_name(&self) -> String {
+        self.model.clone()
+    }
+}
+
+impl CompletionModel<reqwest::Client> {
+    pub fn into_agent_builder(self) -> crate::agent::AgentBuilder<Self> {
+        crate::agent::AgentBuilder::new(self)
+    }
+}
+
+impl completion::CompletionModel for CompletionModel<reqwest::Client> {
     type Response = CompletionResponse;
     type StreamingResponse = StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
         &self,
-        completion_request: CompletionRequest,
+        completion_request: CoreCompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
-        let request = self.create_completion_request(completion_request)?;
-
-        tracing::debug!(
-            "OpenAI request: {request}",
-            request = serde_json::to_string_pretty(&request).unwrap()
-        );
-
-        let response = self
-            .client
-            .post("/chat/completions")
-            .json(&request)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            let t = response.text().await?;
-            tracing::debug!(target: "rig", "OpenAI completion error: {}", t);
-
-            match serde_json::from_str::<ApiResponse<CompletionResponse>>(&t)? {
-                ApiResponse::Ok(response) => {
-                    tracing::info!(target: "rig",
-                        "OpenAI completion token usage: {:?}",
-                        response.usage.clone().map(|usage| format!("{}", usage.total_tokens)).unwrap_or("N/A".to_string())
-                    );
-                    response.try_into()
-                }
-                ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
-            }
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "openai",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = &completion_request.preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = tracing::field::Empty,
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+            tracing::Span::current()
+        };
+
+        let request = CompletionRequest::try_from((self.model.to_owned(), completion_request))?;
+
+        span.record_model_input(&request.messages);
+
+        let body = serde_json::to_vec(&request)?;
+
+        let req = self
+            .client
+            .post("/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+        async move {
+            let response = self.client.send(req).await?;
+
+            if response.status().is_success() {
+                let text = http_client::text(response).await?;
+
+                match serde_json::from_str::<ApiResponse<CompletionResponse>>(&text)? {
+                    ApiResponse::Ok(response) => {
+                        let span = tracing::Span::current();
+                        span.record_model_output(&response.choices);
+                        span.record_response_metadata(&response);
+                        span.record_token_usage(&response.usage);
+                        tracing::debug!("OpenAI response: {response:?}");
+                        response.try_into()
+                    }
+                    ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
+                }
+            } else {
+                let text = http_client::text(response).await?;
+                Err(CompletionError::ProviderError(text))
+            }
         }
+        .instrument(span)
+        .await
     }
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn stream(
         &self,
-        request: CompletionRequest,
+        request: CoreCompletionRequest,
     ) -> Result<
         crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
         CompletionError,

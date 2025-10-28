@@ -5,6 +5,7 @@
 
 use crate::{
     completion::{self, CompletionError},
+    http_client::HttpClientExt,
     json_utils,
     providers::openai::Message,
 };
@@ -13,7 +14,9 @@ use super::client::{Client, xai_api_types::ApiResponse};
 use crate::completion::CompletionRequest;
 use crate::providers::openai;
 use crate::streaming::StreamingCompletionResponse;
+use bytes::Bytes;
 use serde_json::{Value, json};
+use tracing::{Instrument, info_span};
 use xai_api_types::{CompletionResponse, ToolDefinition};
 
 /// xAI completion models as of 2025-06-04
@@ -31,12 +34,12 @@ pub const GROK_4: &str = "grok-4-0709";
 // =================================================================
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub(crate) client: Client<T>,
     pub model: String,
 }
 
-impl CompletionModel {
+impl<T> CompletionModel<T> {
     pub(crate) fn create_completion_request(
         &self,
         completion_request: completion::CompletionRequest,
@@ -71,6 +74,11 @@ impl CompletionModel {
         // Chat history and prompt appear in the order they were provided
         full_history.extend(chat_history);
 
+        let tool_choice = completion_request
+            .tool_choice
+            .map(crate::providers::openrouter::ToolChoice::try_from)
+            .transpose()?;
+
         let mut request = if completion_request.tools.is_empty() {
             json!({
                 "model": self.model,
@@ -83,7 +91,7 @@ impl CompletionModel {
                 "messages": full_history,
                 "temperature": completion_request.temperature,
                 "tools": completion_request.tools.into_iter().map(ToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
             })
         };
 
@@ -95,7 +103,8 @@ impl CompletionModel {
 
         Ok(request)
     }
-    pub fn new(client: Client, model: &str) -> Self {
+
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -103,7 +112,10 @@ impl CompletionModel {
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + Default + std::fmt::Debug + Send + 'static,
+{
     type Response = CompletionResponse;
     type StreamingResponse = openai::StreamingCompletionResponse;
 
@@ -112,23 +124,60 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
+        let request_messages_json_str =
+            serde_json::to_string(&request.get("messages").unwrap()).unwrap();
 
-        let response = self
-            .client
-            .post("/v1/chat/completions")
-            .json(&request)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            match response.json::<ApiResponse<CompletionResponse>>().await? {
-                ApiResponse::Ok(completion) => completion.try_into(),
-                ApiResponse::Error(error) => Err(CompletionError::ProviderError(error.message())),
-            }
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "xai",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = &request_messages_json_str,
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+            tracing::Span::current()
+        };
+
+        tracing::debug!("xAI completion request: {request_messages_json_str}");
+
+        let body = serde_json::to_vec(&request)?;
+        let req = self
+            .client
+            .post("/v1/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+        async move {
+            let response = self.client.http_client.send::<_, Bytes>(req).await?;
+            let status = response.status();
+            let response_body = response.into_body().into_future().await?.to_vec();
+
+            if status.is_success() {
+                match serde_json::from_slice::<ApiResponse<CompletionResponse>>(&response_body)? {
+                    ApiResponse::Ok(completion) => completion.try_into(),
+                    ApiResponse::Error(error) => {
+                        Err(CompletionError::ProviderError(error.message()))
+                    }
+                }
+            } else {
+                Err(CompletionError::ProviderError(
+                    String::from_utf8_lossy(&response_body).to_string(),
+                ))
+            }
         }
+        .instrument(span)
+        .await
     }
 
     #[cfg_attr(feature = "worker", worker::send)]

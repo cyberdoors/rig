@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.11](https://github.com/0xPlaygrounds/rig/compare/rig-eternalai-v0.3.10...rig-eternalai-v0.3.11) - 2025-10-28
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.3.10](https://github.com/0xPlaygrounds/rig/compare/rig-eternalai-v0.3.9...rig-eternalai-v0.3.10) - 2025-10-27
+
+### Other
+
+- Dependent packages no longer force unnecessary features on rig-core ([#964](https://github.com/0xPlaygrounds/rig/pull/964))
+
+## [0.3.9](https://github.com/0xPlaygrounds/rig/compare/rig-eternalai-v0.3.8...rig-eternalai-v0.3.9) - 2025-10-14
+
+### Added
+
+- *(rig-951)* generic HTTP client ([#875](https://github.com/0xPlaygrounds/rig/pull/875))
+
+## [0.3.8](https://github.com/0xPlaygrounds/rig/compare/rig-eternalai-v0.3.7...rig-eternalai-v0.3.8) - 2025-09-29
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.3.7](https://github.com/0xPlaygrounds/rig/compare/rig-eternalai-v0.3.6...rig-eternalai-v0.3.7) - 2025-09-15
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.3.6](https://github.com/0xPlaygrounds/rig/compare/rig-eternalai-v0.3.5...rig-eternalai-v0.3.6) - 2025-09-02
+
+### Other
+
+- *(rig-907)* use where clause for trait bounds ([#749](https://github.com/0xPlaygrounds/rig/pull/749))
+
 ## [0.3.5](https://github.com/0xPlaygrounds/rig/compare/rig-eternalai-v0.3.4...rig-eternalai-v0.3.5) - 2025-08-20
 
 ### Other

@@ -5,14 +5,26 @@ use crate::{
         Chat, Completion, CompletionError, CompletionModel, CompletionRequestBuilder, Document,
         GetTokenUsage, Message, Prompt, PromptError,
     },
+    message::ToolChoice,
     streaming::{StreamingChat, StreamingCompletion, StreamingPrompt},
-    tool::ToolSet,
+    tool::server::ToolServerHandle,
     vector_store::{VectorStoreError, request::VectorSearchRequest},
+    wasm_compat::WasmCompatSend,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 
 const UNKNOWN_AGENT_NAME: &str = "Unnamed Agent";
+
+pub type DynamicContextStore = Arc<
+    RwLock<
+        Vec<(
+            usize,
+            Box<dyn crate::vector_store::VectorStoreIndexDyn + Send + Sync>,
+        )>,
+    >,
+>;
 
 /// Struct representing an LLM agent. An agent is an LLM model combined with a preamble
 /// (i.e.: system prompt) and a static set of context documents and tools.
@@ -42,26 +54,25 @@ where
 {
     /// Name of the agent used for logging and debugging
     pub name: Option<String>,
+    /// Agent description. Primarily useful when using sub-agents as part of an agent workflow and converting agents to other formats.
+    pub description: Option<String>,
     /// Completion model (e.g.: OpenAI's gpt-3.5-turbo-1106, Cohere's command-r)
     pub model: Arc<M>,
     /// System prompt
-    pub preamble: String,
+    pub preamble: Option<String>,
     /// Context documents always available to the agent
     pub static_context: Vec<Document>,
-    /// Tools that are always available to the agent (identified by their name)
-    pub static_tools: Vec<String>,
     /// Temperature of the model
     pub temperature: Option<f64>,
     /// Maximum number of tokens for the completion
     pub max_tokens: Option<u64>,
     /// Additional parameters to be passed to the model
     pub additional_params: Option<serde_json::Value>,
+    pub tool_server_handle: ToolServerHandle,
     /// List of vector store, with the sample number
-    pub dynamic_context: Arc<Vec<(usize, Box<dyn crate::vector_store::VectorStoreIndexDyn>)>>,
-    /// Dynamic tools
-    pub dynamic_tools: Arc<Vec<(usize, Box<dyn crate::vector_store::VectorStoreIndexDyn>)>>,
-    /// Actual tool implementations
-    pub tools: Arc<ToolSet>,
+    pub dynamic_context: DynamicContextStore,
+    /// Whether or not the underlying LLM should be forced to use a tool before providing a response.
+    pub tool_choice: Option<ToolChoice>,
 }
 
 impl<M> Agent<M>
@@ -72,22 +83,15 @@ where
     pub(crate) fn name(&self) -> &str {
         self.name.as_deref().unwrap_or(UNKNOWN_AGENT_NAME)
     }
-
-    /// Returns the name of the agent as an owned variable.
-    /// Useful in some cases where having the agent name as an owned variable is required.
-    pub(crate) fn name_owned(&self) -> String {
-        self.name.clone().unwrap_or(UNKNOWN_AGENT_NAME.to_string())
-    }
 }
 
 impl<M> Completion<M> for Agent<M>
 where
     M: CompletionModel,
 {
-    #[tracing::instrument(skip(self, prompt, chat_history), fields(agent_name = self.name()))]
     async fn completion(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
         chat_history: Vec<Message>,
     ) -> Result<CompletionRequestBuilder<M>, CompletionError> {
         let prompt = prompt.into();
@@ -104,17 +108,26 @@ where
         let completion_request = self
             .model
             .completion_request(prompt)
-            .preamble(self.preamble.clone())
             .messages(chat_history)
             .temperature_opt(self.temperature)
             .max_tokens_opt(self.max_tokens)
             .additional_params_opt(self.additional_params.clone())
             .documents(self.static_context.clone());
+        let completion_request = if let Some(preamble) = &self.preamble {
+            completion_request.preamble(preamble.to_owned())
+        } else {
+            completion_request
+        };
+        let completion_request = if let Some(tool_choice) = &self.tool_choice {
+            completion_request.tool_choice(tool_choice.clone())
+        } else {
+            completion_request
+        };
 
         // If the agent has RAG text, we need to fetch the dynamic context and tools
         let agent = match &rag_text {
             Some(text) => {
-                let dynamic_context = stream::iter(self.dynamic_context.iter())
+                let dynamic_context = stream::iter(self.dynamic_context.read().await.iter())
                     .then(|(num_sample, index)| async {
                         let req = VectorSearchRequest::builder().query(text).samples(*num_sample as u64).build().expect("Creating VectorSearchRequest here shouldn't fail since the query and samples to return are always present");
                         Ok::<_, VectorStoreError>(
@@ -143,68 +156,28 @@ where
                     .await
                     .map_err(|e| CompletionError::RequestError(Box::new(e)))?;
 
-                let dynamic_tools = stream::iter(self.dynamic_tools.iter())
-                    .then(|(num_sample, index)| async {
-                        let req = VectorSearchRequest::builder().query(text).samples(*num_sample as u64).build().expect("Creating VectorSearchRequest here shouldn't fail since the query and samples to return are always present");
-                        Ok::<_, VectorStoreError>(
-                            index
-                                .top_n_ids(req)
-                                .await?
-                                .into_iter()
-                                .map(|(_, id)| id)
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .try_fold(vec![], |mut acc, docs| async {
-                        for doc in docs {
-                            if let Some(tool) = self.tools.get(&doc) {
-                                acc.push(tool.definition(text.into()).await)
-                            } else {
-                                tracing::warn!("Tool implementation not found in toolset: {}", doc);
-                            }
-                        }
-                        Ok(acc)
-                    })
+                let tooldefs = self
+                    .tool_server_handle
+                    .get_tool_defs(Some(text.to_string()))
                     .await
-                    .map_err(|e| CompletionError::RequestError(Box::new(e)))?;
-
-                let static_tools = stream::iter(self.static_tools.iter())
-                    .filter_map(|toolname| async move {
-                        if let Some(tool) = self.tools.get(toolname) {
-                            Some(tool.definition(text.into()).await)
-                        } else {
-                            tracing::warn!(
-                                "Tool implementation not found in toolset: {}",
-                                toolname
-                            );
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .await;
+                    .map_err(|_| {
+                        CompletionError::RequestError("Failed to get tool definitions".into())
+                    })?;
 
                 completion_request
                     .documents(dynamic_context)
-                    .tools([static_tools.clone(), dynamic_tools].concat())
+                    .tools(tooldefs)
             }
             None => {
-                let static_tools = stream::iter(self.static_tools.iter())
-                    .filter_map(|toolname| async move {
-                        if let Some(tool) = self.tools.get(toolname) {
-                            // TODO: tool definitions should likely take an `Option<String>`
-                            Some(tool.definition("".into()).await)
-                        } else {
-                            tracing::warn!(
-                                "Tool implementation not found in toolset: {}",
-                                toolname
-                            );
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .await;
+                let tooldefs = self
+                    .tool_server_handle
+                    .get_tool_defs(None)
+                    .await
+                    .map_err(|_| {
+                        CompletionError::RequestError("Failed to get tool definitions".into())
+                    })?;
 
-                completion_request.tools(static_tools)
+                completion_request.tools(tooldefs)
             }
         };
 
@@ -224,10 +197,9 @@ impl<M> Prompt for Agent<M>
 where
     M: CompletionModel,
 {
-    #[tracing::instrument(skip(self, prompt), fields(agent_name = self.name()))]
     fn prompt(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
     ) -> PromptRequest<'_, prompt_request::Standard, M, ()> {
         PromptRequest::new(self, prompt)
     }
@@ -241,7 +213,7 @@ where
     #[tracing::instrument(skip(self, prompt), fields(agent_name = self.name()))]
     fn prompt(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
     ) -> PromptRequest<'_, prompt_request::Standard, M, ()> {
         PromptRequest::new(*self, prompt)
     }
@@ -255,12 +227,11 @@ where
     #[tracing::instrument(skip(self, prompt, chat_history), fields(agent_name = self.name()))]
     async fn chat(
         &self,
-        prompt: impl Into<Message> + Send,
-        chat_history: Vec<Message>,
+        prompt: impl Into<Message> + WasmCompatSend,
+        mut chat_history: Vec<Message>,
     ) -> Result<String, PromptError> {
-        let mut cloned_history = chat_history.clone();
         PromptRequest::new(self, prompt)
-            .with_history(&mut cloned_history)
+            .with_history(&mut chat_history)
             .await
     }
 }
@@ -269,10 +240,9 @@ impl<M> StreamingCompletion<M> for Agent<M>
 where
     M: CompletionModel,
 {
-    #[tracing::instrument(skip(self, prompt, chat_history), fields(agent_name = self.name()))]
     async fn stream_completion(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
         chat_history: Vec<Message>,
     ) -> Result<CompletionRequestBuilder<M>, CompletionError> {
         // Reuse the existing completion implementation to build the request
@@ -286,8 +256,10 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: GetTokenUsage,
 {
-    #[tracing::instrument(skip(self, prompt), fields(agent_name = self.name()))]
-    fn stream_prompt(&self, prompt: impl Into<Message> + Send) -> StreamingPromptRequest<M, ()> {
+    fn stream_prompt(
+        &self,
+        prompt: impl Into<Message> + WasmCompatSend,
+    ) -> StreamingPromptRequest<M, ()> {
         let arc = Arc::new(self.clone());
         StreamingPromptRequest::new(arc, prompt)
     }
@@ -300,7 +272,7 @@ where
 {
     fn stream_chat(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
         chat_history: Vec<Message>,
     ) -> StreamingPromptRequest<M, ()> {
         let arc = Arc::new(self.clone());

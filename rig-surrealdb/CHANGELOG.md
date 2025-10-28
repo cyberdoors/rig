@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21](https://github.com/0xPlaygrounds/rig/compare/rig-surrealdb-v0.1.20...rig-surrealdb-v0.1.21) - 2025-10-28
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.20](https://github.com/0xPlaygrounds/rig/compare/rig-surrealdb-v0.1.19...rig-surrealdb-v0.1.20) - 2025-10-27
+
+### Added
+
+- *(rig-976)* support filters for `VectorSearchRequest` ([#952](https://github.com/0xPlaygrounds/rig/pull/952))
+- *(rig-996)* generic streaming ([#955](https://github.com/0xPlaygrounds/rig/pull/955))
+
+### Other
+
+- Dependent packages no longer force unnecessary features on rig-core ([#964](https://github.com/0xPlaygrounds/rig/pull/964))
+
+## [0.1.19](https://github.com/0xPlaygrounds/rig/compare/rig-surrealdb-v0.1.18...rig-surrealdb-v0.1.19) - 2025-10-14
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.18](https://github.com/0xPlaygrounds/rig/compare/rig-surrealdb-v0.1.17...rig-surrealdb-v0.1.18) - 2025-09-29
+
+### Fixed
+
+- *(rig-944)* surrealdb WHERE clause causes no results ([#821](https://github.com/0xPlaygrounds/rig/pull/821))
+
+## [0.1.17](https://github.com/0xPlaygrounds/rig/compare/rig-surrealdb-v0.1.16...rig-surrealdb-v0.1.17) - 2025-09-15
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.16](https://github.com/0xPlaygrounds/rig/compare/rig-surrealdb-v0.1.15...rig-surrealdb-v0.1.16) - 2025-09-02
+
+### Other
+
+- *(rig-907)* use where clause for trait bounds ([#749](https://github.com/0xPlaygrounds/rig/pull/749))
+
 ## [0.1.15](https://github.com/0xPlaygrounds/rig/compare/rig-surrealdb-v0.1.14...rig-surrealdb-v0.1.15) - 2025-08-20
 
 ### Other

@@ -10,11 +10,17 @@ More information about this crate can be found in the [crate documentation](http
   - [Installation](#installation)
   - [Simple example:](#simple-example)
   - [Integrations](#integrations)
+  - [Who is using Rig in production?](#who-is-using-rig-in-production)
 
-## High-level features
+## Features
+- Agentic workflows that can handle multi-turn streaming and prompting
+- Full [GenAI Semantic Convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/) compatibility
+- 20+ model providers, all under one singular unified interface
+- 10+ vector store integrations, all under one singular unified interface
 - Full support for LLM completion and embedding workflows
-- Simple but powerful common abstractions over LLM providers (e.g. OpenAI, Cohere) and vector stores (e.g. MongoDB, SQLite, in-memory)
+- Support for transcription, audio generation and image generation model capabilities
 - Integrate LLMs in your app with minimal boilerplate
+- Full WASM compatibility (core library only)
 
 ## Installation
 ```bash
@@ -84,3 +90,14 @@ The following providers are available as separate companion-crates:
 
 - Fastembed: [`rig-fastembed`](https://github.com/0xPlaygrounds/rig/tree/main/rig-fastembed)
 - Eternal AI: [`rig-eternalai`](https://github.com/0xPlaygrounds/rig/tree/main/rig-eternalai)
+
+## Who is using Rig in production?
+Below is a non-exhaustive list of companies and people who are using Rig in production:
+- [St Jude](https://www.stjude.org/) - Using Rig for a chatbot utility as part of [`proteinpaint`](https://github.com/stjude/proteinpaint), a genomics visualisation tool.
+- [Coral Protocol](https://www.coralprotocol.org/) - Using Rig extensively, both internally as well as part of the [Coral Rust SDK.](https://github.com/Coral-Protocol/coral-rs)
+- [VT Code](https://github.com/vinhnx/vtcode) - VT Code is a Rust-based terminal coding agent with semantic code intelligence via Tree-sitter and ast-grep. VT Code uses `rig` for simplifying LLM calls and implement model picker.
+- [Dria](https://dria.co/) - a decentralised AI network. Currently using Rig as part of their [compute node.](https://github.com/firstbatchxyz/dkn-compute-node)
+- [Nethermind](https://www.nethermind.io/) - Using Rig as part of their [Neural Interconnected Nodes Engine](https://github.com/NethermindEth/nine) framework.
+- [Listen](https://github.com/piotrostr/listen) - A framework aiming to become the go-to framework for AI portfolio management agents. Powers [the Listen app.](https://app.listen-rs.com/)
+
+Are you also using Rig in production? [Open an issue](https://www.github.com/0xPlaygrounds/rig/issues) to have your name added!

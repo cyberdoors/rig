@@ -1,9 +1,8 @@
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Value, json};
-use std::{convert::Infallible, str::FromStr};
-
 use super::client::Client;
+use crate::completion::GetTokenUsage;
+use crate::http_client::HttpClientExt;
 use crate::providers::openai::StreamingCompletionResponse;
+use crate::telemetry::SpanCombinator;
 use crate::{
     OneOrMany,
     completion::{self, CompletionError, CompletionRequest},
@@ -11,6 +10,10 @@ use crate::{
     message::{self},
     one_or_many::string_or_one_or_many,
 };
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Value, json};
+use std::{convert::Infallible, str::FromStr};
+use tracing::info_span;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -48,7 +51,10 @@ pub const QWEN_QVQ_PREVIEW: &str = "Qwen/QVQ-72B-Preview";
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 pub struct Function {
     name: String,
-    #[serde(deserialize_with = "deserialize_arguments")]
+    #[serde(
+        serialize_with = "json_utils::stringified_json::serialize",
+        deserialize_with = "deserialize_arguments"
+    )]
     pub arguments: serde_json::Value,
 }
 
@@ -188,12 +194,9 @@ impl From<UserContent> for message::UserContent {
     fn from(value: UserContent) -> Self {
         match value {
             UserContent::Text { text } => message::UserContent::text(text),
-            UserContent::ImageUrl { image_url } => message::UserContent::image(
-                image_url.url,
-                Some(message::ContentFormat::String),
-                None,
-                None,
-            ),
+            UserContent::ImageUrl { image_url } => {
+                message::UserContent::image_url(image_url.url, None, None)
+            }
         }
     }
 }
@@ -204,9 +207,22 @@ impl TryFrom<message::UserContent> for UserContent {
     fn try_from(content: message::UserContent) -> Result<Self, Self::Error> {
         match content {
             message::UserContent::Text(text) => Ok(UserContent::Text { text: text.text }),
-            message::UserContent::Image(message::Image { data, format, .. }) => match format {
-                Some(message::ContentFormat::String) => Ok(UserContent::ImageUrl {
-                    image_url: ImageUrl { url: data },
+            message::UserContent::Document(message::Document {
+                data: message::DocumentSourceKind::Raw(raw),
+                ..
+            }) => {
+                let text = String::from_utf8_lossy(raw.as_slice()).into();
+                Ok(UserContent::Text { text })
+            }
+            message::UserContent::Document(message::Document {
+                data:
+                    message::DocumentSourceKind::Base64(text)
+                    | message::DocumentSourceKind::String(text),
+                ..
+            }) => Ok(UserContent::Text { text }),
+            message::UserContent::Image(message::Image { data, .. }) => match data {
+                message::DocumentSourceKind::Url(url) => Ok(UserContent::ImageUrl {
+                    image_url: ImageUrl { url },
                 }),
                 _ => Err(message::MessageError::ConversionError(
                     "Huggingface only supports images as urls".into(),
@@ -236,14 +252,30 @@ pub enum Message {
         #[serde(default, deserialize_with = "json_utils::null_or_vec")]
         tool_calls: Vec<ToolCall>,
     },
-    #[serde(rename = "Tool")]
+    #[serde(rename = "tool", alias = "Tool")]
     ToolResult {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         arguments: Option<serde_json::Value>,
-        #[serde(deserialize_with = "string_or_one_or_many")]
+        #[serde(
+            deserialize_with = "string_or_one_or_many",
+            serialize_with = "serialize_tool_content"
+        )]
         content: OneOrMany<String>,
     },
+}
+
+fn serialize_tool_content<S>(content: &OneOrMany<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    // OpenAI-compatible APIs expect tool content as a string, not an array
+    let joined = content
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    serializer.serialize_str(&joined)
 }
 
 impl Message {
@@ -299,8 +331,26 @@ impl TryFrom<message::Message> for Vec<Message> {
                             message::UserContent::Text(text) => {
                                 Ok(UserContent::Text { text: text.text })
                             }
+                            message::UserContent::Image(image) => {
+                                let url = image.try_into_url()?;
+
+                                Ok(UserContent::ImageUrl {
+                                    image_url: ImageUrl { url },
+                                })
+                            }
+                            message::UserContent::Document(message::Document {
+                                data: message::DocumentSourceKind::Raw(raw), ..
+                            }) => {
+                                let text = String::from_utf8_lossy(raw.as_slice()).into();
+                                Ok(UserContent::Text { text })
+                            }
+                            message::UserContent::Document(message::Document {
+                                data: message::DocumentSourceKind::Base64(text) | message::DocumentSourceKind::String(text), ..
+                            }) => {
+                                Ok(UserContent::Text { text })
+                            }
                             _ => Err(message::MessageError::ConversionError(
-                                "Huggingface does not support non-text".into(),
+                                "Huggingface inputs only support text and image URLs (both base64-encoded images and regular URLs)".into(),
                             )),
                         })?,
                     }])
@@ -394,7 +444,7 @@ impl TryFrom<Message> for message::Message {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Choice {
     pub finish_reason: String,
     pub index: usize,
@@ -410,7 +460,18 @@ pub struct Usage {
     pub total_tokens: i32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+impl GetTokenUsage for Usage {
+    fn token_usage(&self) -> Option<crate::completion::Usage> {
+        let mut usage = crate::completion::Usage::new();
+        usage.input_tokens = self.prompt_tokens as u64;
+        usage.output_tokens = self.completion_tokens as u64;
+        usage.total_tokens = self.total_tokens as u64;
+
+        Some(usage)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompletionResponse {
     pub created: i32,
     pub id: String,
@@ -419,6 +480,63 @@ pub struct CompletionResponse {
     #[serde(default, deserialize_with = "default_string_on_null")]
     pub system_fingerprint: String,
     pub usage: Usage,
+}
+
+impl crate::telemetry::ProviderResponseExt for CompletionResponse {
+    type OutputMessage = Choice;
+    type Usage = Usage;
+
+    fn get_response_id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+
+    fn get_response_model_name(&self) -> Option<String> {
+        Some(self.model.clone())
+    }
+
+    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
+        self.choices.clone()
+    }
+
+    fn get_text_response(&self) -> Option<String> {
+        let text_response = self
+            .choices
+            .iter()
+            .filter_map(|x| {
+                let Message::User { ref content } = x.message else {
+                    return None;
+                };
+
+                let text = content
+                    .iter()
+                    .filter_map(|x| {
+                        if let UserContent::Text { text } = x {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<String>>();
+
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text.join("\n"))
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        if text_response.is_empty() {
+            None
+        } else {
+            Some(text_response)
+        }
+    }
+
+    fn get_usage(&self) -> Option<Self::Usage> {
+        Some(self.usage.clone())
+    }
 }
 
 fn default_string_on_null<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -492,14 +610,14 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
 }
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub(crate) client: Client<T>,
     /// Name of the model (e.g: google/gemma-2-2b-it)
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T> {
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -533,6 +651,12 @@ impl CompletionModel {
 
         let model = self.client.sub_provider.model_identifier(&self.model);
 
+        let tool_choice = completion_request
+            .tool_choice
+            .clone()
+            .map(crate::providers::openai::completion::ToolChoice::try_from)
+            .transpose()?;
+
         let request = if completion_request.tools.is_empty() {
             json!({
                 "model": model,
@@ -545,14 +669,17 @@ impl CompletionModel {
                 "messages": full_history,
                 "temperature": completion_request.temperature,
                 "tools": completion_request.tools.clone().into_iter().map(ToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
             })
         };
         Ok(request)
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + 'static,
+{
     type Response = CompletionResponse;
     type StreamingResponse = StreamingCompletionResponse;
 
@@ -561,7 +688,26 @@ impl completion::CompletionModel for CompletionModel {
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "huggingface",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = &completion_request.preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = tracing::field::Empty,
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
         let request = self.create_request_body(&completion_request)?;
+        span.record_model_input(&request.get("messages"));
 
         let path = self.client.sub_provider.completion_endpoint(&self.model);
 
@@ -571,27 +717,42 @@ impl completion::CompletionModel for CompletionModel {
             request
         };
 
-        let response = self.client.post(&path).json(&request).send().await?;
+        let request = serde_json::to_vec(&request)?;
+
+        let request = self
+            .client
+            .post(&path)?
+            .header("Content-Type", "application/json")
+            .body(request)
+            .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+        let response = self.client.send(request).await?;
 
         if response.status().is_success() {
-            let t = response.text().await?;
-            tracing::debug!(target: "rig", "Huggingface completion error: {}", t);
+            let bytes: Vec<u8> = response.into_body().await?;
+            let text = String::from_utf8_lossy(&bytes);
 
-            match serde_json::from_str::<ApiResponse<CompletionResponse>>(&t)? {
+            tracing::debug!(target: "rig", "Huggingface completion error: {}", text);
+
+            match serde_json::from_slice::<ApiResponse<CompletionResponse>>(&bytes)? {
                 ApiResponse::Ok(response) => {
-                    tracing::info!(target: "rig",
-                        "Huggingface completion token usage: {:?}",
-                        format!("{:?}", response.usage)
-                    );
+                    let span = tracing::Span::current();
+                    span.record_token_usage(&response.usage);
+                    span.record_model_output(&response.choices);
+                    span.record_response_metadata(&response);
+
                     response.try_into()
                 }
                 ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.to_string())),
             }
         } else {
+            let status = response.status();
+            let text: Vec<u8> = response.into_body().await?;
+            let text: String = String::from_utf8_lossy(&text).into();
+
             Err(CompletionError::ProviderError(format!(
                 "{}: {}",
-                response.status(),
-                response.text().await?
+                status, text
             )))
         }
     }
