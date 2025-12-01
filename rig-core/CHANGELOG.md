@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.2](https://github.com/cyberdoors/rig/compare/rig-core-v0.23.1...rig-core-v0.23.2) - 2025-10-28
+
+### Other
+
+- *(deps)* upgrade rmcp dependency ([#1008](https://github.com/cyberdoors/rig/pull/1008))
+
 ## [0.23.1](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.23.0...rig-core-v0.23.1) - 2025-10-28
 
 ### Fixed
